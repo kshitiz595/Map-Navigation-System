@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Map Navigation System</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🗺️ Advanced Map Navigation System</h1>
+            <p>Dijkstra's Algorithm & A* Search Implementation with Turn-by-Turn Navigation</p>
+        </div>
+        
+        <div class="main-content">
+            <div class="controls">
+                <div class="control-group">
+                    <label for="startNode">Start Location:</label>
+                    <select id="startNode">
+                        <option value="">Select starting point...</option>
+                    </select>
+                </div>
+                
+                <div class="control-group">
+                    <label for="endNode">Destination:</label>
+                    <select id="endNode">
+                        <option value="">Select destination...</option>
+                    </select>
+                </div>
+                
+                <div class="control-group">
+                    <label for="algorithm">Algorithm:</label>
+                    <select id="algorithm">
+                        <option value="dijkstra">Dijkstra's Algorithm</option>
+                        <option value="astar">A* Search</option>
+                    </select>
+                </div>
+                
+                <div class="algorithm-info" id="algorithmInfo">
+                    <h3>Dijkstra's Algorithm</h3>
+                    <p>Finds shortest path by exploring all nodes systematically. Guaranteed optimal solution.</p>
+                </div>
+                
+                <button class="btn" onclick="findRoute()">
+                    🚀 Find Route
+                </button>
+                
+                <button class="btn btn-secondary" onclick="clearRoute()">
+                    🧹 Clear Route
+                </button>
+                
+                <button class="btn btn-secondary" onclick="generateRandomGraph()">
+                    🎲 Generate New Map
+                </button>
+                
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p>Computing optimal route...</p>
+                </div>
+                
+                <div class="stats" id="stats" style="display: none;">
+                    <h4>📊 Route Statistics</h4>
+                    <div class="stat-item">
+                        <span>Total Distance:</span>
+                        <span id="totalDistance">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span>Nodes Visited:</span>
+                        <span id="nodesVisited">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span>Computation Time:</span>
+                        <span id="computeTime">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span>Algorithm Used:</span>
+                        <span id="algorithmUsed">-</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="map-container">
+                <canvas id="mapCanvas" class="map-canvas"></canvas>
+                
+                <div class="instructions" id="instructions" style="display: none;">
+                    <h3>🧭 Turn-by-Turn Directions</h3>
+                    <div id="instructionsList"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
