@@ -4,7 +4,7 @@ A browser-based interactive pathfinding tool that implements *Dijkstra's Algorit
 
 ---
 
-![Map Navigation Screenshot](./picture1.jpg)
+![Map Navigation Screenshot]([./picture1.jpg](https://github.com/kshitiz595/Map-Navigation-System/blob/main/Screenshot%202025-07-25%20135844.png))
 ![Map Navigation Screenshot](./picture2.jpg)
 ![Map Navigation Screenshot](./picture3.jpg)
 
