@@ -5,8 +5,8 @@ A browser-based interactive pathfinding tool that implements *Dijkstra's Algorit
 ---
 
 ![Map Navigation Screenshot](./Map%20Navigation%201.png)
-![Map Navigation Screenshot](./picture2.jpg)
-![Map Navigation Screenshot](./picture3.jpg)
+![Map Navigation Screenshot](./Map%20Navigation%202.png)
+![Map Navigation Screenshot](./Map%20Navigation%203.png)
 
 ## 🔍 Features
 
