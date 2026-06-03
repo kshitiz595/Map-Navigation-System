@@ -94,3 +94,188 @@
     <script src="script.js"></script>
 </body>
 </html>
+"""
+file_loader.py
+==============
+Handles loading of all file types into a pandas DataFrame.
+Supports: CSV, JSON, TXT (OTC array-of-arrays format), Excel (.xlsx/.xls)
+
+KEY FEATURE: adds a  __source_line__  column so every row
+             knows its original line number in the source file.
+             This is what powers exact line-level fault reporting.
+"""
+
+from __future__ import annotations
+import json
+import re
+import pandas as pd
+from pathlib import Path
+
+
+class FileLoader:
+    """
+    Detect file type and load into DataFrame with line tracking.
+
+    Usage:
+        loader = FileLoader()
+        df, meta = loader.load("OTC_LME_2026_05_29.txt")
+        # df has a __source_line__ column with original line numbers
+        # meta = {"format": "txt_array", "total_lines": 523, ...}
+    """
+
+    def load(self, filepath: str | Path) -> tuple[pd.DataFrame, dict]:
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {filepath}")
+
+        ext = path.suffix.lower()
+        size_kb = round(path.stat().st_size / 1024, 1)
+
+        if ext == ".csv":
+            df, fmt = self._load_csv(path)
+        elif ext in (".xlsx", ".xls"):
+            df, fmt = self._load_excel(path)
+        elif ext == ".json":
+            df, fmt = self._load_json(path)
+        elif ext == ".txt":
+            df, fmt = self._load_txt(path)
+        else:
+            # Try CSV as fallback for unknown extensions
+            try:
+                df, fmt = self._load_csv(path)
+                fmt = f"csv_fallback (original ext: {ext})"
+            except Exception:
+                raise ValueError(
+                    f"Unsupported file type: {ext}. "
+                    f"Supported: .csv  .json  .txt  .xlsx  .xls"
+                )
+
+        meta = {
+            "filepath":    str(path),
+            "filename":    path.name,
+            "format":      fmt,
+            "size_kb":     size_kb,
+            "total_rows":  len(df),
+            "columns":     df.columns.tolist(),
+        }
+        return df, meta
+
+    # ── CSV ───────────────────────────────────────────────────────────────
+
+    def _load_csv(self, path: Path) -> tuple[pd.DataFrame, str]:
+        df = pd.read_csv(path, low_memory=False)
+        # CSV: row 0 in df = line 2 in file (line 1 is header)
+        df["__source_line__"] = range(2, len(df) + 2)
+        return df, "csv"
+
+    # ── Excel ─────────────────────────────────────────────────────────────
+
+    def _load_excel(self, path: Path, sheet: str | int = 0) -> tuple[pd.DataFrame, str]:
+        df = pd.read_excel(path, sheet_name=sheet)
+        df["__source_line__"] = range(2, len(df) + 2)
+        return df, "excel"
+
+    # ── JSON ──────────────────────────────────────────────────────────────
+
+    def _load_json(self, path: Path) -> tuple[pd.DataFrame, str]:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+
+        # Format 1: array of objects  [{...}, {...}]
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+            df = pd.DataFrame(raw)
+            df["__source_line__"] = range(1, len(df) + 1)
+            return df, "json_objects"
+
+        # Format 2: array of arrays  [["col1","col2",...], [val1,val2,...]]
+        if isinstance(raw, list) and raw and isinstance(raw[0], list):
+            headers = raw[0]
+            records = raw[1:]
+            df = pd.DataFrame(records, columns=headers)
+            df["__source_line__"] = range(2, len(df) + 2)
+            return df, "json_array_of_arrays"
+
+        # Format 3: {"data": [...]}  — nested
+        if isinstance(raw, dict):
+            for key in ("data", "records", "rows", "items", "results"):
+                if key in raw and isinstance(raw[key], list):
+                    df = pd.DataFrame(raw[key])
+                    df["__source_line__"] = range(1, len(df) + 1)
+                    return df, f"json_nested_{key}"
+
+        raise ValueError("JSON format not recognised. Expected array-of-objects or array-of-arrays.")
+
+    # ── TXT (OTC LME format) ──────────────────────────────────────────────
+
+    def _load_txt(self, path: Path) -> tuple[pd.DataFrame, str]:
+        """
+        Handles the OTC LME Deutsche Bank format:
+
+          Line 1:  [["Book","Cpty","DealID",...],
+          Line 2:  ["PMFFBASE","Deutsche Bank",  "102476927",...],
+          ...
+
+        Each line is one element of a JSON array.
+        Strategy: read all lines, reconstruct full JSON, parse as array-of-arrays.
+        """
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
+
+        # ── Strategy 1: treat entire file as valid JSON ────────────────
+        try:
+            return self._load_json_from_string(raw_text, path)
+        except Exception:
+            pass
+
+        # ── Strategy 2: OTC line-by-line format ───────────────────────
+        # Each line ends with ],  or ]  — strip and rebuild array
+        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        cleaned = []
+        for line in lines:
+            line = re.sub(r',\s*$', '', line)  # remove trailing comma
+            cleaned.append(line)
+
+        # Join into a JSON array
+        joined = "[" + ",\n".join(cleaned) + "]"
+        try:
+            return self._load_json_from_string(joined, path)
+        except Exception:
+            pass
+
+        # ── Strategy 3: CSV-style TXT ──────────────────────────────────
+        try:
+            # Try pipe, tab, semicolon delimiters
+            for sep in ["|", "\t", ";"]:
+                try:
+                    df = pd.read_csv(path, sep=sep, low_memory=False)
+                    if len(df.columns) > 1:
+                        df["__source_line__"] = range(2, len(df) + 2)
+                        return df, f"txt_delimited_{sep}"
+                except Exception:
+                    continue
+            # Plain CSV
+            df = pd.read_csv(path, low_memory=False)
+            df["__source_line__"] = range(2, len(df) + 2)
+            return df, "txt_csv"
+        except Exception as e:
+            raise ValueError(f"Could not parse TXT file '{path.name}': {e}")
+
+    def _load_json_from_string(self, text: str, path: Path) -> tuple[pd.DataFrame, str]:
+        data = json.loads(text)
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            headers = [str(h) for h in data[0]]
+            records = data[1:]
+            df = pd.DataFrame(records, columns=headers)
+            # Line numbers: header=line 1, row 0=line 2, etc.
+            df["__source_line__"] = range(2, len(df) + 2)
+            return df, "txt_array_of_arrays"
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            df = pd.DataFrame(data)
+            df["__source_line__"] = range(1, len(df) + 1)
+            return df, "txt_json_objects"
+        raise ValueError("Unrecognised JSON structure in TXT file.")
+
+
+# ── Convenience function ──────────────────────────────────────────────────────
+
+def load_file(filepath: str | Path) -> tuple[pd.DataFrame, dict]:
+    """One-line interface: df, meta = load_file('myfile.txt')"""
+    return FileLoader().load(filepath)
