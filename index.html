@@ -1345,3 +1345,3596 @@ def generate_accounts(n=300):
         if random.random() < 0.03: row["currency"]    = "INVALID_CCY"
         data.append(row)
     return pd.DataFrame(data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================================================================
+# SCORING PROFILES
+# The scoring_selector.py algorithm picks the best one
+# automatically based on file characteristics.
+# ================================================================
+
+profiles:
+
+  REGULATORY:
+    description: >
+      For regulatory reporting files (OTC, LME, MiFID, EMIR).
+      Completeness and accuracy dominate.
+    weights:
+      completeness: 0.40
+      accuracy:     0.35
+      consistency:  0.20
+      freshness:    0.05
+    thresholds:
+      excellent:  97
+      good:       92
+      acceptable: 85
+      poor:       70
+    selection_signals:
+      regulatory_keywords: ["OTC","LME","EMIR","MIFID","REGULATORY","REPORT","POSITION"]
+      min_critical_field_ratio: 0.50
+      freshness_sla_hours_max:  48
+
+  OPERATIONAL:
+    description: >
+      For day-to-day operational feeds (payments, settlements).
+      Balanced weights, freshness matters.
+    weights:
+      completeness: 0.35
+      accuracy:     0.28
+      consistency:  0.22
+      freshness:    0.15
+    thresholds:
+      excellent:  95
+      good:       87
+      acceptable: 75
+      poor:       60
+    selection_signals:
+      operational_keywords: ["PAYMENT","TRANSACTION","SETTLEMENT","TXN","PAY"]
+      freshness_sla_hours_max: 8
+
+  REFERENCE:
+    description: >
+      For reference/master data (accounts, counterparties).
+      Accuracy and consistency dominate, freshness low.
+    weights:
+      completeness: 0.30
+      accuracy:     0.38
+      consistency:  0.27
+      freshness:    0.05
+    thresholds:
+      excellent:  96
+      good:       90
+      acceptable: 80
+      poor:       65
+    selection_signals:
+      reference_keywords: ["ACCOUNT","MASTER","REFERENCE","CUSTOMER","COUNTERPARTY","INSTRUMENT"]
+      min_enum_field_ratio: 0.30
+      freshness_sla_hours_max: 168
+
+  INTRADAY:
+    description: >
+      For high-frequency intraday feeds (prices, positions).
+      Freshness is critical.
+    weights:
+      completeness: 0.28
+      accuracy:     0.27
+      consistency:  0.18
+      freshness:    0.27
+    thresholds:
+      excellent:  94
+      good:       85
+      acceptable: 72
+      poor:       55
+    selection_signals:
+      intraday_keywords: ["PRICE","TICK","INTRADAY","REALTIME","LIVE","MARKET"]
+      freshness_sla_hours_max: 1
+      min_row_count: 1000
+
+  TRADE:
+    description: >
+      For trade booking and position feeds.
+      Consistency elevated due to interdependent fields.
+    weights:
+      completeness: 0.33
+      accuracy:     0.30
+      consistency:  0.27
+      freshness:    0.10
+    thresholds:
+      excellent:  96
+      good:       89
+      acceptable: 78
+      poor:       62
+    selection_signals:
+      trade_keywords: ["TRADE","DEAL","BOOK","POSITION","LEG","NOTIONAL"]
+      min_consistency_rule_count: 2
+
+
+default_profile: OPERATIONAL
+min_profile_confidence: 0.60
+
+
+
+
+
+
+
+
+
+   """
+file_loader.py
+==============
+Handles all file types: CSV, JSON, TXT (OTC format), Excel.
+
+KEY FIXES:
+  1. Comma-inside-field handling — values like
+     "Deutsche Bank, Frankfurt" no longer split into two columns.
+  2. Auto-detects delimiter (comma, semicolon, pipe, tab).
+  3. Adds __source_line__ to every row for exact line reporting.
+"""
+
+from __future__ import annotations
+import csv
+import json
+import re
+import pandas as pd
+from pathlib import Path
+
+
+class FileLoader:
+
+    def load(self, filepath: str | Path) -> tuple[pd.DataFrame, dict]:
+        path    = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {filepath}")
+
+        ext     = path.suffix.lower()
+        size_kb = round(path.stat().st_size / 1024, 1)
+
+        if ext == ".csv":
+            df, fmt = self._load_csv(path)
+        elif ext in (".xlsx", ".xls"):
+            df, fmt = self._load_excel(path)
+        elif ext == ".json":
+            df, fmt = self._load_json(path)
+        elif ext == ".txt":
+            df, fmt = self._load_txt(path)
+        else:
+            try:
+                df, fmt = self._load_csv(path)
+                fmt = f"csv_fallback({ext})"
+            except Exception:
+                raise ValueError(
+                    f"Unsupported: {ext}. "
+                    f"Supported: .csv .json .txt .xlsx .xls"
+                )
+
+        meta = {
+            "filepath":   str(path),
+            "filename":   path.name,
+            "format":     fmt,
+            "size_kb":    size_kb,
+            "total_rows": len(df),
+            "columns":    df.columns.tolist(),
+        }
+        return df, meta
+
+    # ── CSV ───────────────────────────────────────────────────────────────
+
+    def _load_csv(self, path: Path) -> tuple[pd.DataFrame, str]:
+        """
+        Handles CSVs with commas inside quoted field values.
+        e.g. "Deutsche Bank, Frankfurt" stays as one column.
+
+        Strategy:
+          1. Read raw text and detect delimiter outside quoted strings
+          2. Use pandas with quotechar='"' and skipinitialspace=True
+          3. Fall back to csv.Sniffer if step 2 produces only 1 column
+          4. Final plain fallback
+        """
+        raw       = path.read_text(encoding="utf-8", errors="replace")
+        delimiter = self._detect_delimiter(raw)
+
+        # Step 1: Pandas with proper quoting
+        try:
+            df = pd.read_csv(
+                path,
+                sep=delimiter,
+                quotechar='"',
+                quoting=csv.QUOTE_MINIMAL,
+                skipinitialspace=True,
+                low_memory=False,
+                encoding="utf-8",
+                on_bad_lines="warn",
+            )
+            if len(df.columns) > 1:
+                df["__source_line__"] = range(2, len(df) + 2)
+                return df, f"csv(delimiter='{delimiter}')"
+        except Exception:
+            pass
+
+        # Step 2: csv.Sniffer dialect detection
+        try:
+            dialect = csv.Sniffer().sniff(raw[:4096])
+            df = pd.read_csv(
+                path,
+                dialect=dialect,
+                low_memory=False,
+                on_bad_lines="warn",
+            )
+            if len(df.columns) > 1:
+                df["__source_line__"] = range(2, len(df) + 2)
+                return df, "csv(sniffer)"
+        except Exception:
+            pass
+
+        # Step 3: Plain fallback
+        df = pd.read_csv(path, low_memory=False, on_bad_lines="warn")
+        df["__source_line__"] = range(2, len(df) + 2)
+        return df, "csv(plain)"
+
+    def _detect_delimiter(self, raw_text: str) -> str:
+        """
+        Counts candidate delimiters in the first line,
+        ignoring occurrences inside quoted strings.
+        """
+        first_line = raw_text.split("\n")[0]
+        candidates = {",": 0, ";": 0, "|": 0, "\t": 0}
+        in_quotes  = False
+
+        for ch in first_line:
+            if ch == '"':
+                in_quotes = not in_quotes
+            elif not in_quotes and ch in candidates:
+                candidates[ch] += 1
+
+        best = max(candidates, key=candidates.get)
+        return best if candidates[best] > 0 else ","
+
+    # ── Excel ─────────────────────────────────────────────────────────────
+
+    def _load_excel(
+        self, path: Path, sheet: str | int = 0
+    ) -> tuple[pd.DataFrame, str]:
+        df = pd.read_excel(path, sheet_name=sheet)
+        df["__source_line__"] = range(2, len(df) + 2)
+        return df, "excel"
+
+    # ── JSON ──────────────────────────────────────────────────────────────
+
+    def _load_json(self, path: Path) -> tuple[pd.DataFrame, str]:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+
+        # Format 1: [{...}, {...}]
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+            df = pd.DataFrame(raw)
+            df["__source_line__"] = range(1, len(df) + 1)
+            return df, "json_objects"
+
+        # Format 2: [["col1","col2"], [val1,val2], ...]
+        if isinstance(raw, list) and raw and isinstance(raw[0], list):
+            headers = raw[0]
+            records = raw[1:]
+            df = pd.DataFrame(records, columns=headers)
+            df["__source_line__"] = range(2, len(df) + 2)
+            return df, "json_array_of_arrays"
+
+        # Format 3: {"data": [...]}
+        if isinstance(raw, dict):
+            for key in ("data", "records", "rows", "items", "results"):
+                if key in raw and isinstance(raw[key], list):
+                    df = pd.DataFrame(raw[key])
+                    df["__source_line__"] = range(1, len(df) + 1)
+                    return df, f"json_nested_{key}"
+
+        raise ValueError("JSON format not recognised.")
+
+    # ── TXT (OTC LME + general) ───────────────────────────────────────────
+
+    def _load_txt(self, path: Path) -> tuple[pd.DataFrame, str]:
+        """
+        Handles OTC LME format (JSON array of arrays split
+        across lines) and general delimited TXT files.
+        """
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
+
+        # Strategy 1: entire file is valid JSON
+        try:
+            return self._load_json_from_string(raw_text, path)
+        except Exception:
+            pass
+
+        # Strategy 2: OTC line-by-line (each line is one array element)
+        lines   = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+        cleaned = [re.sub(r',\s*$', '', ln) for ln in lines]
+        joined  = "[" + ",\n".join(cleaned) + "]"
+        try:
+            return self._load_json_from_string(joined, path)
+        except Exception:
+            pass
+
+        # Strategy 3: delimited TXT — use smart CSV loader
+        try:
+            return self._load_csv(path)
+        except Exception as e:
+            raise ValueError(f"Could not parse TXT '{path.name}': {e}")
+
+    def _load_json_from_string(
+        self, text: str, path: Path
+    ) -> tuple[pd.DataFrame, str]:
+        data = json.loads(text)
+
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            headers = [str(h) for h in data[0]]
+            records = data[1:]
+            df      = pd.DataFrame(records, columns=headers)
+            df["__source_line__"] = range(2, len(df) + 2)
+            return df, "txt_array_of_arrays"
+
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            df = pd.DataFrame(data)
+            df["__source_line__"] = range(1, len(df) + 1)
+            return df, "txt_json_objects"
+
+        raise ValueError("Unrecognised JSON structure in TXT file.")
+
+
+def load_file(filepath: str | Path) -> tuple[pd.DataFrame, dict]:
+    """One-line interface: df, meta = load_file('myfile.txt')"""
+    return FileLoader().load(filepath)         
+
+
+
+
+
+
+
+            """
+root_cause.py
+=============
+Root Cause Analysis Engine.
+
+For every violation, answers three questions:
+  1. WHY did this error occur?       (root cause + explanation)
+  2. WHERE did it likely come from?  (upstream origin)
+  3. WHAT ELSE breaks because of it? (system → process → business risk)
+"""
+
+from __future__ import annotations
+
+
+ROOT_CAUSES = {
+
+    "null_value_critical": {
+        "category":    "UPSTREAM_FEED_GAP",
+        "title":       "Upstream System Not Populating Required Field",
+        "explanation": (
+            "A required critical field contains no value. The upstream source "
+            "system is likely not sending this field at all, the ETL pipeline "
+            "has a mapping gap, or the field was added to the schema after the "
+            "pipeline was last updated."
+        ),
+        "likely_origin": [
+            "Source system updated output schema without notifying downstream",
+            "ETL mapping table missing this field",
+            "Field conditionally populated but condition never met in this batch",
+            "Data migration left legacy records without this field",
+        ],
+        "prevention": (
+            "Add NOT NULL constraint validation at ETL ingestion layer. "
+            "Implement schema contract testing between producer and consumer."
+        ),
+    },
+
+    "null_value_high": {
+        "category":    "ETL_MAPPING_GAP",
+        "title":       "ETL Pipeline Mapping Incomplete",
+        "explanation": (
+            "A high-impact field is null in some rows. The upstream data likely "
+            "exists but the transformation pipeline is not mapping it correctly "
+            "for a subset of records — often caused by conditional logic in the "
+            "ETL that silently drops values."
+        ),
+        "likely_origin": [
+            "Conditional ETL logic not covering all record types",
+            "NULL handling difference between source and target systems",
+            "Optional field in source treated as required in target",
+        ],
+        "prevention": "Add field-level completeness checks in ETL before load.",
+    },
+
+    "null_value_medium": {
+        "category":    "OPTIONAL_FIELD_NOT_SENT",
+        "title":       "Optional Field Missing From Source",
+        "explanation": (
+            "A medium-impact field is null. The source system may treat this "
+            "as optional. Downstream reports that depend on this field will "
+            "produce incomplete output."
+        ),
+        "likely_origin": [
+            "Source system treats field as optional",
+            "Business event does not always generate this value",
+            "Late-arriving data — field populated in a subsequent update",
+        ],
+        "prevention": "Implement default value rules in ETL for known optional fields.",
+    },
+
+    "invalid_date_format": {
+        "category":    "FORMAT_MISMATCH",
+        "title":       "Date Format Mismatch Between Systems",
+        "explanation": (
+            "Date values exist but are in the wrong format. Almost always caused "
+            "by two systems using different regional date conventions "
+            "(DD/MM/YYYY vs MM/DD/YYYY), a source system upgrade that changed "
+            "its output format, or manual data entry using a non-standard format."
+        ),
+        "likely_origin": [
+            "Source system changed date format after a software upgrade",
+            "Regional locale difference (UK DD/MM vs US MM/DD)",
+            "Manual entry by operations team using spreadsheet format",
+            "Data migration from legacy system with different date standard",
+            "Time zone conversion stripping the time component",
+        ],
+        "prevention": (
+            "Enforce ISO 8601 (YYYY-MM-DD) at the API/feed contract level. "
+            "Add format validation as the first step in ETL."
+        ),
+    },
+
+    "unparseable_date": {
+        "category":    "CORRUPT_OR_INVALID_DATA",
+        "title":       "Value Cannot Be Parsed As Any Known Date Format",
+        "explanation": (
+            "The field contains a value that cannot be interpreted as a date "
+            "in any common format. This suggests the value is free text, a "
+            "placeholder, an identifier that was placed in the wrong column, "
+            "or data corruption during transmission."
+        ),
+        "likely_origin": [
+            "Wrong column mapping in ETL — value from a different field",
+            "Free text placeholder ('TBD', 'N/A', 'UNKNOWN') used instead of NULL",
+            "Data corruption during file transfer",
+            "Manual entry error in source system",
+        ],
+        "prevention": (
+            "Add strict type validation at source system input. "
+            "Reject non-date values at ETL boundary with clear error logging."
+        ),
+    },
+
+    "sentinel_date": {
+        "category":    "SENTINEL_VALUE_USED_AS_NULL",
+        "title":       "System Using Placeholder Date Instead of NULL",
+        "explanation": (
+            "The date '1899-12-30' or similar sentinel values appear. This is "
+            "a well-known pattern from legacy systems (especially Excel and older "
+            "databases) that cannot store NULL dates and use a fixed placeholder "
+            "instead. These are not real dates — they mean no date available."
+        ),
+        "likely_origin": [
+            "Legacy system cannot store NULL in date columns",
+            "Excel date serial number 0 = 1900-01-00 = displayed as 1899-12-30",
+            "Mainframe system using fixed placeholder for absent dates",
+            "Database DEFAULT constraint set to sentinel instead of NULL",
+        ],
+        "prevention": (
+            "Add sentinel-to-NULL translation in ETL before any date validation."
+        ),
+    },
+
+    "invalid_enum": {
+        "category":    "SCHEMA_DRIFT",
+        "title":       "Unexpected Value — Possible Schema Change Upstream",
+        "explanation": (
+            "A field contains a value outside the agreed set of allowed values. "
+            "Most commonly caused by an upstream system adding a new status or "
+            "category without notifying downstream consumers, a data migration "
+            "bringing in historical values, or a manual entry error."
+        ),
+        "likely_origin": [
+            "Upstream system added new enum value without change notification",
+            "Data migration brought values from old system with different codes",
+            "Manual entry or batch upload using free text instead of coded value",
+            "System configuration difference between UAT and production",
+            "Typo or case inconsistency in source system",
+        ],
+        "prevention": (
+            "Maintain a shared data dictionary with agreed enum values. "
+            "Implement contract testing between producer and consumer systems."
+        ),
+    },
+
+    "out_of_range_below_min": {
+        "category":    "DATA_INTEGRITY_VIOLATION",
+        "title":       "Value Below Valid Minimum — Possible Sign Error or Unit Mismatch",
+        "explanation": (
+            "A numeric value falls below the minimum valid threshold. Could mean "
+            "a sign error (negative when it should be positive), a unit mismatch "
+            "(cents sent when dollars expected), or genuine data corruption. "
+            "Requires human verification before any action."
+        ),
+        "likely_origin": [
+            "Sign convention difference between source and target (debit/credit)",
+            "Unit mismatch — source in minor currency units (pence/cents)",
+            "Calculation error in upstream system",
+            "Test data mixed into production batch",
+        ],
+        "prevention": (
+            "Document unit and sign conventions in feed specification. "
+            "Add range checks in source system."
+        ),
+    },
+
+    "out_of_range_above_max": {
+        "category":    "DATA_INTEGRITY_VIOLATION",
+        "title":       "Value Above Valid Maximum — Possible Unit or Magnitude Error",
+        "explanation": (
+            "A numeric value exceeds the maximum valid threshold. Could indicate "
+            "a unit error (billions sent when millions expected), a runaway "
+            "calculation, or a legitimate large transaction needing limit review."
+        ),
+        "likely_origin": [
+            "Unit magnitude error (millions vs billions)",
+            "Repeated aggregation in pipeline causing value multiplication",
+            "Legitimate large transaction requiring manual limit approval",
+            "Data corruption in transmission",
+        ],
+        "prevention": (
+            "Implement value reasonableness checks with escalation workflow "
+            "for large values."
+        ),
+    },
+
+    "invalid_format": {
+        "category":    "FORMAT_MISMATCH",
+        "title":       "Field Fails Format Validation Pattern",
+        "explanation": (
+            "A field value exists but does not match the expected format pattern. "
+            "Common causes are identifiers with wrong check digits, extra "
+            "characters, or encoding issues introducing special characters."
+        ),
+        "likely_origin": [
+            "Source system changed identifier format after migration",
+            "Character encoding issue introducing special characters",
+            "Manual correction applied without following format rules",
+            "Truncation in ETL cutting off required suffix/prefix",
+        ],
+        "prevention": "Apply regex validation at source system API level.",
+    },
+
+    "duplicate_value": {
+        "category":    "DUPLICATE_SUBMISSION",
+        "title":       "Duplicate Key — Possible Double Submission or Feed Replay",
+        "explanation": (
+            "A field marked as unique contains duplicate values. In a payment "
+            "or trade context this is serious — it may mean the same transaction "
+            "was submitted twice, a feed was replayed without deduplication, or "
+            "a retry mechanism created multiple records for one event."
+        ),
+        "likely_origin": [
+            "Message queue retry sending the same message twice",
+            "Manual feed replay without clearing existing records",
+            "Two source systems sending the same transaction independently",
+            "ETL restart from checkpoint causing duplicate processing",
+            "Sequence number generator reset causing ID collision",
+        ],
+        "prevention": (
+            "Implement idempotency keys at message queue level. "
+            "Add unique constraint at database level to reject duplicates at load."
+        ),
+    },
+
+    "duplicate_row": {
+        "category":    "DUPLICATE_SUBMISSION",
+        "title":       "Fully Duplicate Row — Feed Replay or Double Send",
+        "explanation": (
+            "Entire rows are identical. This almost always indicates a feed "
+            "was sent twice, a batch job ran twice, or a recovery process "
+            "replayed data without first clearing the target."
+        ),
+        "likely_origin": [
+            "Batch job triggered twice due to scheduler error",
+            "Disaster recovery failover replaying already-processed data",
+            "Manual file resubmission without removing existing records",
+        ],
+        "prevention": (
+            "Add row-level hash deduplication at ETL ingestion. "
+            "Track batch execution IDs."
+        ),
+    },
+
+    "consistency_violation": {
+        "category":    "BUSINESS_RULE_VIOLATION",
+        "title":       "Cross-Field Logical Contradiction",
+        "explanation": (
+            "Two or more fields in the same record contain values that "
+            "contradict each other according to business rules. Typically "
+            "indicates a data entry error, a system integration bug where "
+            "fields from different sources were misaligned, or a partially "
+            "updated record."
+        ),
+        "likely_origin": [
+            "Fields populated by different systems at different times",
+            "Record partially updated leaving inconsistent intermediate state",
+            "Manual override of one field without updating dependent fields",
+            "System integration mapping error joining wrong fields",
+        ],
+        "prevention": (
+            "Implement cross-field validation rules in source system before write."
+        ),
+    },
+
+    "statistical_anomaly": {
+        "category":    "ANOMALOUS_VALUE",
+        "title":       "Statistical Outlier — Requires Domain Expert Review",
+        "explanation": (
+            "A value is statistically unusual compared to the rest of the "
+            "dataset (beyond 3 standard deviations from the mean). Does not "
+            "necessarily mean wrong — large trades are legitimate — but "
+            "requires human review to confirm it is intentional."
+        ),
+        "likely_origin": [
+            "Genuine large transaction requiring limit approval",
+            "Unit error (millions instead of thousands)",
+            "Test or dummy data mixed into production",
+            "Calculation error in upstream aggregation",
+        ],
+        "prevention": (
+            "Implement outlier flagging workflow with domain expert sign-off."
+        ),
+    },
+
+    "missing_column": {
+        "category":    "SCHEMA_BREAKING_CHANGE",
+        "title":       "Required Column Absent — Schema Breaking Change",
+        "explanation": (
+            "A column required by the data contract is completely absent. "
+            "This means the upstream system changed its output schema without "
+            "notification, the wrong file version was sent, or the ETL "
+            "extraction query is missing a field."
+        ),
+        "likely_origin": [
+            "Upstream system deployed schema change without change management",
+            "Wrong file version or template used for this batch",
+            "ETL SELECT query not including new required field",
+            "File generated from report that excludes certain columns",
+        ],
+        "prevention": (
+            "Implement schema versioning and contract testing. "
+            "Add column presence check as first pipeline step."
+        ),
+    },
+}
+
+
+IMPACT_CHAIN = {
+    "otc_lme_positions": {
+        "Book": {
+            "systems":   ["PnL Engine", "Position Keeping", "Risk Engine"],
+            "processes": ["Daily PnL Calculation", "Risk Limit Monitoring",
+                          "Regulatory Capital Calculation"],
+            "business_risks": [
+                "PnL figures incorrect — trader and desk PnL reports unreliable",
+                "Risk limits may appear breached or under-used incorrectly",
+                "Capital requirement calculations wrong — regulatory breach possible",
+            ],
+        },
+        "Cpty": {
+            "systems":   ["KYC Validation Service", "Reconciliation Engine",
+                          "Regulatory Reporting"],
+            "processes": ["Counterparty Credit Risk Calculation",
+                          "EMIR/MiFID Trade Reporting", "Nostro Reconciliation"],
+            "business_risks": [
+                "Trade cannot be attributed to counterparty — credit exposure unknown",
+                "Regulatory report missing counterparty LEI — reportable breach",
+                "Reconciliation breaks — settlement may fail",
+            ],
+        },
+        "DealID": {
+            "systems":   ["Audit Trail", "Deduplication Service",
+                          "Settlement Engine"],
+            "processes": ["Trade Lifecycle Management",
+                          "Settlement Instruction Generation"],
+            "business_risks": [
+                "Cannot track trade through its lifecycle",
+                "Duplicate trades cannot be detected",
+                "Settlement instructions cannot be matched to trades",
+            ],
+        },
+        "Position": {
+            "systems":   ["PnL Engine", "Risk Engine", "Regulatory Reporting"],
+            "processes": ["Daily PnL", "VaR Calculation",
+                          "Position Limit Monitoring"],
+            "business_risks": [
+                "PnL calculation wrong — financial misstatement risk",
+                "VaR models producing incorrect output",
+                "Position limits may appear breached incorrectly",
+                "Regulatory position reports inaccurate",
+            ],
+        },
+        "Metal": {
+            "systems":   ["Pricing Engine", "Risk Engine"],
+            "processes": ["Mark-to-Market Valuation",
+                          "Commodity Risk Calculation"],
+            "business_risks": [
+                "Wrong pricing curve used for valuation",
+                "Commodity risk calculated against wrong metal",
+            ],
+        },
+        "Ccy": {
+            "systems":   ["FX Conversion Service", "PnL Engine"],
+            "processes": ["Currency Conversion",
+                          "Multi-Currency PnL Reporting"],
+            "business_risks": [
+                "FX conversion uses wrong rate or no conversion at all",
+                "PnL reported in wrong currency",
+            ],
+        },
+        "Prompt": {
+            "systems":   ["Settlement Engine", "Pricing Engine", "MIS Reports"],
+            "processes": ["Settlement Date Calculation",
+                          "Forward Curve Pricing"],
+            "business_risks": [
+                "Settlement instruction sent to wrong date — fails at custodian",
+                "Forward pricing uses wrong tenor",
+            ],
+        },
+    },
+
+    "payment_transactions": {
+        "account_id": {
+            "systems":   ["Reconciliation Engine", "Ledger Posting",
+                          "Client Portal"],
+            "processes": ["Account Reconciliation", "Ledger Entry",
+                          "Client Statement Generation"],
+            "business_risks": [
+                "Payment cannot be posted to any account — funds in suspense",
+                "Client account balance incorrect",
+                "Reconciliation breaks — nostro/vostro mismatch",
+            ],
+        },
+        "amount": {
+            "systems":   ["Risk Engine", "Regulatory Reporting",
+                          "Reconciliation Engine", "Ledger Posting"],
+            "processes": ["Transaction Monitoring", "AML Screening",
+                          "Large Value Payment Reporting"],
+            "business_risks": [
+                "AML transaction monitoring cannot assess payment risk",
+                "Large value reporting threshold checks impossible",
+                "Ledger entries will not balance",
+            ],
+        },
+        "currency": {
+            "systems":   ["FX Conversion Service", "Reporting Dashboard"],
+            "processes": ["Currency Conversion", "Multi-Currency Reporting"],
+            "business_risks": [
+                "FX conversion fails — payment stuck",
+                "Reporting totals wrong due to no currency conversion",
+            ],
+        },
+        "transaction_date": {
+            "systems":   ["Reconciliation Engine", "MIS Reports",
+                          "Regulatory Reporting"],
+            "processes": ["Value Date Calculation",
+                          "Same-Day Payment Cut-Off",
+                          "Daily Transaction Reporting"],
+            "business_risks": [
+                "Value date calculation wrong — payment misses cut-off",
+                "Daily transaction count reports incorrect",
+            ],
+        },
+        "status": {
+            "systems":   ["Workflow Engine", "Client Notifications",
+                          "Risk Engine"],
+            "processes": ["Payment Workflow Routing",
+                          "Client Alert Generation"],
+            "business_risks": [
+                "Payment workflow cannot route to correct next step",
+                "Client not notified of payment status",
+            ],
+        },
+    },
+
+    "trade_records": {
+        "trade_id": {
+            "systems":   ["Position Keeping", "PnL Engine", "Audit Trail"],
+            "processes": ["Trade Lifecycle Tracking", "PnL Attribution"],
+            "business_risks": [
+                "Trade cannot be tracked through its lifecycle",
+                "PnL cannot be attributed to specific trade",
+                "Audit trail broken — compliance risk",
+            ],
+        },
+        "notional": {
+            "systems":   ["PnL Engine", "Risk Engine",
+                          "Regulatory Reporting"],
+            "processes": ["Mark-to-Market", "VaR Calculation",
+                          "Trade Reporting"],
+            "business_risks": [
+                "PnL calculation impossible without notional",
+                "Risk measures (DV01, PV01) cannot be computed",
+                "Regulatory trade reports incomplete",
+            ],
+        },
+        "settlement_date": {
+            "systems":   ["Settlement Engine", "Custody System"],
+            "processes": ["Settlement Instruction Generation",
+                          "Fails Management"],
+            "business_risks": [
+                "Settlement instruction cannot be generated",
+                "Trade fails at custodian — penalty interest charged",
+                "Securities not delivered on time",
+            ],
+        },
+        "direction": {
+            "systems":   ["Position Keeping", "Risk Engine"],
+            "processes": ["Net Position Calculation",
+                          "Risk Direction Assessment"],
+            "business_risks": [
+                "Position calculated as wrong direction (long vs short)",
+                "Risk hedging assessment incorrect",
+                "PnL sign wrong",
+            ],
+        },
+    },
+}
+
+
+def get_root_cause(
+    violation_type: str,
+    field_name:     str,
+    impact_level:   str,
+) -> dict:
+    specific = f"{violation_type}_{impact_level}"
+    if specific in ROOT_CAUSES:
+        return ROOT_CAUSES[specific]
+    if violation_type in ROOT_CAUSES:
+        return ROOT_CAUSES[violation_type]
+    return {
+        "category":    "UNKNOWN",
+        "title":       "Unclassified Data Quality Issue",
+        "explanation": (
+            f"Field '{field_name}' has a '{violation_type}' violation. "
+            f"Root cause could not be automatically determined."
+        ),
+        "likely_origin": ["Manual investigation required"],
+        "prevention":   (
+            "Add specific rule to root_cause.py for this violation type."
+        ),
+    }
+
+
+def get_impact_chain(feed_name: str, field_name: str) -> dict:
+    return IMPACT_CHAIN.get(feed_name, {}).get(field_name, {
+        "systems":        ["Downstream system — check IMPACT_CHAIN in root_cause.py"],
+        "processes":      ["Not yet mapped"],
+        "business_risks": ["Not yet mapped"],
+    })
+
+
+
+
+"""
+scoring_selector.py
+===================
+Automatic Scoring Profile Selector.
+
+Analyses file and feed characteristics, scores each profile,
+returns the best match with confidence score and reasoning.
+
+Algorithm:
+  1. Extract 7 features from DataFrame + feed config
+  2. Score each profile against those features
+  3. Return highest scoring profile + explanation
+"""
+
+from __future__ import annotations
+import logging
+import yaml
+import pandas as pd
+from dataclasses import dataclass
+from pathlib import Path
+
+from .config_loader import get_feed_rules, load_scoring_config
+
+log           = logging.getLogger("scoring_selector")
+PROFILES_FILE = (
+    Path(__file__).resolve().parent.parent / "config" / "scoring_profiles.yaml"
+)
+
+
+@dataclass
+class ProfileSelection:
+    profile_name:  str
+    profile:       dict
+    confidence:    float
+    match_scores:  dict
+    reasoning:     list[str]
+    features:      dict
+
+
+class ScoringProfileSelector:
+
+    def __init__(self):
+        self.profiles = self._load_profiles()
+
+    def select(
+        self,
+        df:        pd.DataFrame,
+        feed_name: str,
+        meta:      dict | None = None,
+    ) -> ProfileSelection:
+        meta     = meta or {}
+        features = self._extract_features(df, feed_name, meta)
+        scores   = self._score_profiles(features, feed_name, meta)
+
+        best_name  = max(scores, key=scores.get)
+        best_score = scores[best_name]
+        total      = sum(scores.values()) or 1
+        confidence = round(best_score / total, 3)
+
+        min_conf = self.profiles.get("min_profile_confidence", 0.60)
+        if confidence < min_conf:
+            default   = self.profiles.get("default_profile", "OPERATIONAL")
+            reasoning = [
+                f"No profile reached confidence threshold ({min_conf}). "
+                f"Defaulting to '{default}'.",
+                f"Best candidate: '{best_name}' at {confidence:.0%} confidence.",
+                "Add keywords to scoring_profiles.yaml to improve detection.",
+            ]
+            return ProfileSelection(
+                profile_name=default,
+                profile=self.profiles["profiles"][default],
+                confidence=confidence,
+                match_scores=scores,
+                reasoning=reasoning,
+                features=features,
+            )
+
+        reasoning = self._build_reasoning(
+            best_name, features, scores, feed_name, meta
+        )
+        return ProfileSelection(
+            profile_name=best_name,
+            profile=self.profiles["profiles"][best_name],
+            confidence=confidence,
+            match_scores=scores,
+            reasoning=reasoning,
+            features=features,
+        )
+
+    def _extract_features(
+        self, df: pd.DataFrame, feed_name: str, meta: dict
+    ) -> dict:
+        try:
+            feed_rules  = get_feed_rules(feed_name)
+            field_rules = feed_rules.get("field_rules", {})
+        except Exception:
+            field_rules = {}
+
+        total_fields = max(len(field_rules), 1)
+        critical_fields = sum(
+            1 for r in field_rules.values()
+            if r.get("downstream_impact") == "critical"
+        )
+        datetime_fields = sum(
+            1 for r in field_rules.values()
+            if r.get("type") == "datetime"
+        )
+        enum_fields = sum(
+            1 for r in field_rules.values()
+            if "allowed_values" in r
+        )
+        scoring_cfg = load_scoring_config()
+        sla_hours   = (
+            scoring_cfg.get("freshness_sla", {}).get(feed_name, 24)
+        )
+        data_cols   = [c for c in df.columns if not c.startswith("__")]
+        null_rate   = (
+            df[data_cols].isna().mean().mean() if data_cols else 0.0
+        )
+
+        return {
+            "critical_field_ratio": critical_fields / total_fields,
+            "datetime_field_ratio": datetime_fields / total_fields,
+            "enum_field_ratio":     enum_fields / total_fields,
+            "sla_hours":            sla_hours,
+            "null_rate":            null_rate,
+            "row_count":            len(df),
+            "total_fields":         total_fields,
+            "filename_upper":       meta.get("filename", feed_name).upper(),
+            "feed_name_upper":      feed_name.upper(),
+        }
+
+    def _score_profiles(
+        self, features: dict, feed_name: str, meta: dict
+    ) -> dict[str, float]:
+        scores = {name: 0.0 for name in self.profiles["profiles"]}
+        text   = features["filename_upper"] + " " + features["feed_name_upper"]
+
+        for prof_name, prof in self.profiles["profiles"].items():
+            signals = prof.get("selection_signals", {})
+            score   = 0.0
+
+            for key_type in [
+                "regulatory_keywords", "operational_keywords",
+                "reference_keywords", "intraday_keywords", "trade_keywords",
+            ]:
+                for kw in signals.get(key_type, []):
+                    if kw.upper() in text:
+                        score += 3.0
+
+            min_crit = signals.get("min_critical_field_ratio", 0)
+            if features["critical_field_ratio"] >= min_crit:
+                score += features["critical_field_ratio"] * 2.0
+
+            min_enum = signals.get("min_enum_field_ratio", 0)
+            if features["enum_field_ratio"] >= min_enum:
+                score += features["enum_field_ratio"] * 1.5
+
+            sla_max = signals.get("freshness_sla_hours_max", 999)
+            if features["sla_hours"] <= sla_max:
+                tightness = 1.0 - (features["sla_hours"] / max(sla_max, 1))
+                score += tightness * 2.0
+
+            min_rows = signals.get("min_row_count", 0)
+            if features["row_count"] >= min_rows:
+                score += 0.5
+
+            scores[prof_name] = round(score, 3)
+
+        return scores
+
+    def _build_reasoning(
+        self, profile_name: str, features: dict,
+        scores: dict, feed_name: str, meta: dict
+    ) -> list[str]:
+        reasons = [
+            f"Selected profile: '{profile_name}'",
+            "Profile scores: " + ", ".join(
+                f"{k}={v:.2f}"
+                for k, v in sorted(scores.items(), key=lambda x: -x[1])
+            ),
+        ]
+        text  = features["filename_upper"] + " " + features["feed_name_upper"]
+        prof  = self.profiles["profiles"][profile_name]
+        for key_type in [
+            "regulatory_keywords", "operational_keywords",
+            "reference_keywords", "intraday_keywords", "trade_keywords",
+        ]:
+            for kw in prof.get("selection_signals", {}).get(key_type, []):
+                if kw.upper() in text:
+                    reasons.append(f"Keyword match: '{kw}'")
+        reasons.append(
+            f"Critical field ratio: "
+            f"{features['critical_field_ratio']:.0%}"
+        )
+        reasons.append(
+            f"Freshness SLA: {features['sla_hours']}h"
+        )
+        reasons.append(
+            "Weights selected: " + ", ".join(
+                f"{k.title()}={int(v*100)}%"
+                for k, v in prof["weights"].items()
+            )
+        )
+        return reasons
+
+    def _load_profiles(self) -> dict:
+        if PROFILES_FILE.exists():
+            with open(PROFILES_FILE) as f:
+                return yaml.safe_load(f)
+        return {
+            "default_profile": "OPERATIONAL",
+            "min_profile_confidence": 0.60,
+            "profiles": {
+                "OPERATIONAL": {
+                    "description": "Default",
+                    "weights": {
+                        "completeness": 0.35, "accuracy": 0.28,
+                        "consistency": 0.22, "freshness": 0.15,
+                    },
+                    "thresholds": {
+                        "excellent": 95, "good": 87,
+                        "acceptable": 75, "poor": 60,
+                    },
+                    "selection_signals": {},
+                }
+            }
+        }
+
+
+
+
+
+
+
+
+        """
+detector.py
+===========
+Null / Missing Field Detector — Final Version.
+
+Detects:
+  - Null / missing required fields
+  - Sentinel dates (1899-12-30 etc)
+  - Date format wrong (e.g. DD/MM/YYYY when YYYY-MM-DD expected)
+  - Completely unparseable dates
+  - Enum / allowed value violations
+  - Numeric range violations
+  - Regex format violations
+  - Duplicate keys
+  - Duplicate full rows
+  - Statistical anomalies (3-sigma)
+
+Every violation records:
+  - Exact source file line numbers
+  - Root cause category and explanation
+  - Likely upstream origins
+  - Downstream impact chain
+"""
+
+from __future__ import annotations
+import re
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+from .config_loader import get_feed_rules, load_scoring_config
+from .root_cause    import get_root_cause, get_impact_chain
+
+
+SENTINEL_DATES = {
+    "1899-12-30", "1900-01-01", "9999-12-31",
+    "0000-00-00", "1899-12-31", "1900-12-31",
+    "1899-12-30 00:00:00", "1900-01-01 00:00:00",
+}
+
+KNOWN_DATE_FORMATS = [
+    # ISO standard
+    "%Y-%m-%d",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    # European DD/MM/YYYY
+    "%d/%m/%Y",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%d-%m-%Y",
+    "%d.%m.%Y",
+    # American MM/DD/YYYY
+    "%m/%d/%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m-%d-%Y",
+    # Compact
+    "%Y%m%d",
+    "%d%m%Y",
+    # Text months
+    "%d %b %Y",
+    "%d %B %Y",
+    "%b %d %Y",
+    "%B %d %Y",
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    # With timezone suffix
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    # Slash with year last
+    "%Y/%m/%d",
+]
+
+
+@dataclass
+class FieldViolation:
+    field_name:             str
+    violation_type:         str
+    severity:               str
+    affected_rows:          list[int]
+    source_lines:           list[int]
+    affected_count:         int
+    total_rows:             int
+    null_rate:              float
+    fill_strategy:          str
+    fill_detail:            str
+    downstream_impact:      str
+    sample_bad_values:      list
+    root_cause_category:    str       = ""
+    root_cause_title:       str       = ""
+    root_cause_explanation: str       = ""
+    likely_origins:         list[str] = field(default_factory=list)
+    prevention:             str       = ""
+    impacted_systems:       list[str] = field(default_factory=list)
+    impacted_processes:     list[str] = field(default_factory=list)
+    business_risks:         list[str] = field(default_factory=list)
+
+
+@dataclass
+class DetectionResult:
+    feed_name:       str
+    source_file:     str
+    file_format:     str
+    run_timestamp:   datetime
+    total_rows:      int
+    total_fields:    int
+    violations:      list[FieldViolation]   = field(default_factory=list)
+    missing_columns: list[str]              = field(default_factory=list)
+    critical_rows:   list[int]              = field(default_factory=list)
+    flagged_df:      Optional[pd.DataFrame] = None
+
+    @property
+    def has_critical_issues(self) -> bool:
+        return any(
+            v.downstream_impact == "critical" for v in self.violations
+        )
+
+    @property
+    def total_violations(self) -> int:
+        return len(self.violations)
+
+    @property
+    def critical_violation_count(self) -> int:
+        return sum(
+            1 for v in self.violations
+            if v.downstream_impact == "critical"
+        )
+
+
+class NullFieldDetector:
+
+    def __init__(self, feed_name: str):
+        self.feed_name   = feed_name
+        self.rules       = get_feed_rules(feed_name)
+        self.field_rules = self.rules.get("field_rules", {})
+        self.required    = self.rules.get("required_fields", [])
+
+    def scan(
+        self,
+        df:          pd.DataFrame,
+        source_file: str = "",
+    ) -> DetectionResult:
+
+        result = DetectionResult(
+            feed_name=self.feed_name,
+            source_file=source_file,
+            file_format="",
+            run_timestamp=datetime.now(),
+            total_rows=len(df),
+            total_fields=len(self.field_rules),
+        )
+
+        has_line_col = "__source_line__" in df.columns
+        flagged      = df.copy()
+
+        def get_source_lines(row_indices: list[int]) -> list[int]:
+            if not has_line_col:
+                return [i + 2 for i in row_indices]
+            valid = [i for i in row_indices if i in df.index]
+            return df.loc[valid, "__source_line__"].tolist()
+
+        def make_violation(
+            field_name:     str,
+            violation_type: str,
+            bad_rows:       list[int],
+            null_rate:      float,
+            sample_bad:     list,
+            rule:           dict,
+            fill_detail:    str = "",
+        ) -> FieldViolation:
+            impact = rule.get("downstream_impact", "medium")
+            rc     = get_root_cause(violation_type, field_name, impact)
+            chain  = get_impact_chain(self.feed_name, field_name)
+            return FieldViolation(
+                field_name=field_name,
+                violation_type=violation_type,
+                severity=impact,
+                affected_rows=bad_rows,
+                source_lines=get_source_lines(bad_rows),
+                affected_count=len(bad_rows),
+                total_rows=len(df),
+                null_rate=round(null_rate, 4),
+                fill_strategy=rule.get("fill_strategy", "none"),
+                fill_detail=fill_detail or self._fill_detail(field_name, rule),
+                downstream_impact=impact,
+                sample_bad_values=sample_bad,
+                root_cause_category=rc.get("category", ""),
+                root_cause_title=rc.get("title", ""),
+                root_cause_explanation=rc.get("explanation", ""),
+                likely_origins=rc.get("likely_origin", []),
+                prevention=rc.get("prevention", ""),
+                impacted_systems=chain.get("systems", []),
+                impacted_processes=chain.get("processes", []),
+                business_risks=chain.get("business_risks", []),
+            )
+
+        # ── Scan each field ───────────────────────────────────────────────
+        for field_name, rule in self.field_rules.items():
+
+            # 1. Missing column entirely
+            if field_name not in df.columns:
+                result.missing_columns.append(field_name)
+                sample_rows = list(range(min(len(df), 5)))
+                v = make_violation(
+                    field_name, "missing_column",
+                    sample_rows, 1.0, [], rule,
+                )
+                v.affected_count = len(df)
+                v.source_lines   = get_source_lines(sample_rows)
+                result.violations.append(v)
+                continue
+
+            col = df[field_name]
+
+            # 2. Null / empty
+            if not rule.get("nullable", True):
+                null_mask = self._is_null(col)
+                if null_mask.any():
+                    bad_rows = null_mask[null_mask].index.tolist()
+                    vtype    = (
+                        f"null_value_"
+                        f"{rule.get('downstream_impact', 'medium')}"
+                    )
+                    v = make_violation(
+                        field_name, vtype,
+                        bad_rows, null_mask.mean(), [], rule,
+                    )
+                    v.violation_type = "null_value"
+                    result.violations.append(v)
+                    flagged.loc[bad_rows, f"__null__{field_name}"] = True
+                    if rule.get("downstream_impact") == "critical":
+                        result.critical_rows.extend(bad_rows)
+
+            # 3. Sentinel date detection
+            if rule.get("type") == "datetime":
+                col_str   = col.dropna().astype(str).str.strip()
+                sent_mask = col_str.isin(SENTINEL_DATES)
+                if sent_mask.any():
+                    bad_rows = sent_mask[sent_mask].index.tolist()
+                    samples  = col_str[sent_mask].unique()[:5].tolist()
+                    v = make_violation(
+                        field_name, "sentinel_date",
+                        bad_rows, 0.0, samples, rule,
+                        fill_detail=(
+                            "Sentinel date found (e.g. 1899-12-30). "
+                            "Legacy system using placeholder instead of NULL. "
+                            "Translate to NULL in ETL layer."
+                        ),
+                    )
+                    result.violations.append(v)
+                    flagged.loc[bad_rows, f"__sentinel__{field_name}"] = True
+
+            # 4. Date format validation (wrong format + unparseable)
+            if rule.get("type") == "datetime":
+                target_fmt = rule.get("format", "%Y-%m-%d")
+                non_null   = col.dropna()
+                non_sent   = non_null[
+                    ~non_null.astype(str).str.strip().isin(SENTINEL_DATES)
+                ]
+
+                if len(non_sent) > 0:
+                    correct, wrong_fmt, unparseable = [], [], []
+
+                    for idx, val in non_sent.items():
+                        classification = self._classify_date(
+                            str(val).strip(), target_fmt
+                        )
+                        if classification == "correct":
+                            correct.append(idx)
+                        elif classification == "wrong_format":
+                            wrong_fmt.append(idx)
+                        else:
+                            unparseable.append(idx)
+
+                    # Wrong format — date parseable but in different format
+                    if wrong_fmt:
+                        samples = (
+                            non_sent.loc[wrong_fmt]
+                            .astype(str).unique()[:5].tolist()
+                        )
+                        detected = self._detect_actual_formats(
+                            non_sent.loc[wrong_fmt[:20]].astype(str).tolist()
+                        )
+                        v = make_violation(
+                            field_name, "invalid_date_format",
+                            wrong_fmt, 0.0, samples, rule,
+                            fill_detail=(
+                                f"Expected: '{target_fmt}'. "
+                                f"Detected formats in bad rows: {detected}. "
+                                f"Normalise to {target_fmt} in ETL before load."
+                            ),
+                        )
+                        result.violations.append(v)
+                        flagged.loc[
+                            wrong_fmt, f"__wrongfmt__{field_name}"
+                        ] = True
+
+                    # Completely unparseable — not a date at all
+                    if unparseable:
+                        samples = (
+                            non_sent.loc[unparseable]
+                            .astype(str).unique()[:5].tolist()
+                        )
+                        v = make_violation(
+                            field_name, "unparseable_date",
+                            unparseable, 0.0, samples, rule,
+                            fill_detail=(
+                                "Values cannot be parsed as any known date format. "
+                                "May be free text, wrong column, or corrupt data. "
+                                "Manual investigation required."
+                            ),
+                        )
+                        result.violations.append(v)
+                        flagged.loc[
+                            unparseable, f"__baddate__{field_name}"
+                        ] = True
+
+            # 5. Enum / allowed values
+            if "allowed_values" in rule:
+                non_null  = col.dropna()
+                non_empty = non_null[
+                    non_null.astype(str).str.strip() != ""
+                ]
+                allowed   = [str(a) for a in rule["allowed_values"]]
+                bad_mask  = ~non_empty.astype(str).isin(allowed)
+                if bad_mask.any():
+                    bad_rows = bad_mask[bad_mask].index.tolist()
+                    samples  = non_empty[bad_mask].unique()[:5].tolist()
+                    v = make_violation(
+                        field_name, "invalid_enum",
+                        bad_rows, 0.0, samples, rule,
+                        fill_detail=(
+                            f"Allowed: {rule['allowed_values']}. "
+                            f"Found: {samples[:3]}."
+                        ),
+                    )
+                    result.violations.append(v)
+                    flagged.loc[bad_rows, f"__enum__{field_name}"] = True
+
+            # 6. Numeric range
+            if rule.get("type") in ("float", "int"):
+                numeric = pd.to_numeric(col, errors="coerce").dropna()
+                for bound, label in [
+                    (rule.get("min"), "out_of_range_below_min"),
+                    (rule.get("max"), "out_of_range_above_max"),
+                ]:
+                    if bound is None:
+                        continue
+                    bad_mask = (
+                        numeric < bound
+                        if "below" in label
+                        else numeric > bound
+                    )
+                    if bad_mask.any():
+                        bad_rows = bad_mask[bad_mask].index.tolist()
+                        v = make_violation(
+                            field_name, label,
+                            bad_rows, 0.0,
+                            numeric[bad_mask].tolist()[:5],
+                            rule,
+                            fill_detail=(
+                                f"Value {'below min' if 'below' in label else 'above max'}"
+                                f" ({bound}). Manual review required."
+                            ),
+                        )
+                        result.violations.append(v)
+
+            # 7. Regex format
+            if "regex" in rule and rule.get("type") == "string":
+                pattern      = re.compile(rule["regex"])
+                non_null_str = col.dropna().astype(str)
+                bad_mask     = ~non_null_str.apply(
+                    lambda x: bool(pattern.match(x))
+                )
+                if bad_mask.any():
+                    bad_rows = bad_mask[bad_mask].index.tolist()
+                    v = make_violation(
+                        field_name, "invalid_format",
+                        bad_rows, 0.0,
+                        non_null_str[bad_mask].tolist()[:5],
+                        rule,
+                        fill_detail=f"Expected pattern: {rule['regex']}",
+                    )
+                    result.violations.append(v)
+
+            # 8. Unique / duplicate key
+            if rule.get("unique"):
+                dupes = col.dropna()[col.dropna().duplicated(keep=False)]
+                if not dupes.empty:
+                    bad_rows = dupes.index.tolist()
+                    v = make_violation(
+                        field_name, "duplicate_value",
+                        bad_rows, 0.0,
+                        dupes.unique()[:5].tolist(),
+                        rule,
+                        fill_detail=(
+                            f"Field '{field_name}' must be unique. "
+                            f"{len(bad_rows)} duplicates found."
+                        ),
+                    )
+                    result.violations.append(v)
+
+            # 9. Statistical anomaly (numeric fields only)
+            if rule.get("type") in ("float", "int"):
+                numeric = pd.to_numeric(col, errors="coerce").dropna()
+                if len(numeric) >= 30:
+                    std = numeric.std()
+                    if std > 0:
+                        z_scores = (numeric - numeric.mean()).abs() / std
+                        outliers = z_scores > 3.0
+                        if outliers.any():
+                            bad_rows = outliers[outliers].index.tolist()
+                            v = make_violation(
+                                field_name, "statistical_anomaly",
+                                bad_rows, 0.0,
+                                numeric[outliers].tolist()[:5],
+                                rule,
+                                fill_detail=(
+                                    f"Values exceed 3σ. "
+                                    f"Mean={numeric.mean():,.2f}, "
+                                    f"StdDev={std:,.2f}."
+                                ),
+                            )
+                            result.violations.append(v)
+
+        # ── Full row duplicates ───────────────────────────────────────────
+        data_cols  = [c for c in df.columns if not c.startswith("__")]
+        full_dupes = df[data_cols].duplicated(keep=False)
+        if full_dupes.any():
+            bad_rows = full_dupes[full_dupes].index.tolist()
+            rc       = get_root_cause("duplicate_row", "__FULL_ROW__", "critical")
+            result.violations.append(FieldViolation(
+                field_name="__FULL_ROW__",
+                violation_type="duplicate_row",
+                severity="critical",
+                affected_rows=bad_rows,
+                source_lines=get_source_lines(bad_rows),
+                affected_count=len(bad_rows),
+                total_rows=len(df),
+                null_rate=0.0,
+                fill_strategy="none",
+                fill_detail=(
+                    "Remove duplicate rows. Keep most recent by timestamp."
+                ),
+                downstream_impact="critical",
+                sample_bad_values=[],
+                root_cause_category=rc.get("category", ""),
+                root_cause_title=rc.get("title", ""),
+                root_cause_explanation=rc.get("explanation", ""),
+                likely_origins=rc.get("likely_origin", []),
+                prevention=rc.get("prevention", ""),
+                impacted_systems=[],
+                impacted_processes=[],
+                business_risks=[],
+            ))
+
+        result.critical_rows = list(set(result.critical_rows))
+        result.flagged_df    = flagged
+        return result
+
+    # ── Date helpers ──────────────────────────────────────────────────────
+
+    def _classify_date(self, val: str, target_fmt: str) -> str:
+        """
+        Returns 'correct', 'wrong_format', or 'unparseable'.
+        """
+        if not val or val.lower() in (
+            "nan", "none", "nat", "null", "n/a", "na", ""
+        ):
+            return "correct"   # null — handled by null check
+
+        # Correct format
+        try:
+            pd.to_datetime(val, format=target_fmt)
+            return "correct"
+        except Exception:
+            pass
+
+        # Different but known format
+        for fmt in KNOWN_DATE_FORMATS:
+            if fmt == target_fmt:
+                continue
+            try:
+                pd.to_datetime(val, format=fmt)
+                return "wrong_format"
+            except Exception:
+                pass
+
+        # Pandas lenient parse as last resort
+        try:
+            parsed = pd.to_datetime(val)
+            if 1900 <= parsed.year <= 2100:
+                return "wrong_format"
+        except Exception:
+            pass
+
+        return "unparseable"
+
+    def _detect_actual_formats(self, values: list[str]) -> list[str]:
+        """
+        For a list of wrong-format date strings, identifies
+        which formats they actually match.
+        Useful for the report: "found DD/MM/YYYY, expected YYYY-MM-DD"
+        """
+        found = set()
+        for val in values:
+            val = str(val).strip()
+            for fmt in KNOWN_DATE_FORMATS:
+                try:
+                    pd.to_datetime(val, format=fmt)
+                    found.add(fmt)
+                    break
+                except Exception:
+                    pass
+        return sorted(found) or ["unknown format"]
+
+    # ── General helpers ───────────────────────────────────────────────────
+
+    def _is_null(self, series: pd.Series) -> pd.Series:
+        return series.isna() | series.astype(str).str.strip().eq("")
+
+    def _fill_detail(self, field_name: str, rule: dict) -> str:
+        s = rule.get("fill_strategy", "none")
+        if s == "none":
+            return "No automated fill — manual data sourcing required."
+        if s == "lookup":
+            return (
+                f"Look up from "
+                f"'{rule.get('fill_source', 'master table')}'."
+            )
+        if s == "default":
+            return f"Fill with default: '{rule.get('fill_default', 'N/A')}'."
+        if s == "derived":
+            return f"Derive '{field_name}' from related fields."
+        if s == "system_timestamp":
+            return "Use record ingestion timestamp as proxy."
+        return "Check fill_strategy in field_rules.yaml."
+
+
+
+
+
+"""
+scorer.py
+=========
+Quality Scorer — uses the auto-selected scoring profile.
+Dimensions: Completeness | Accuracy | Consistency | Freshness
+"""
+
+from __future__ import annotations
+import pandas as pd
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Optional
+
+from .detector          import DetectionResult
+from .scoring_selector  import ProfileSelection
+from .config_loader     import load_scoring_config, get_feed_rules
+
+
+@dataclass
+class DimensionScore:
+    name:       str
+    score:      float
+    weight:     float
+    weighted:   float
+    details:    str
+    violations: int = 0
+
+
+@dataclass
+class QualityScoreResult:
+    feed_name:          str
+    run_timestamp:      datetime
+    total_rows:         int
+    profile_name:       str
+    profile_reasoning:  list[str]
+    completeness:       DimensionScore
+    accuracy:           DimensionScore
+    consistency:        DimensionScore
+    freshness:          DimensionScore
+    overall_score:      float
+    grade:              str
+    alert_triggered:    bool             = False
+    alert_message:      str              = ""
+    trend_delta:        Optional[float]  = None
+    score_history:      list[float]      = field(default_factory=list)
+    all_profile_scores: dict             = field(default_factory=dict)
+
+
+CONSISTENCY_RULES = {
+    "otc_lme_positions": [
+        {
+            "name": "prompt_sentinel_for_non_swap",
+            "description": "Non-SWAP contracts should not use sentinel dates",
+            "check": lambda df: (
+                (df.get(
+                    "ContractType",
+                    pd.Series("", index=df.index)
+                ) != "SWAP") &
+                (pd.to_datetime(
+                    df.get(
+                        "Prompt",
+                        pd.Series("2000-01-01", index=df.index)
+                    ),
+                    errors="coerce"
+                ).dt.year == 1899)
+            ) if "Prompt" in df.columns
+              else pd.Series(False, index=df.index),
+        },
+    ],
+    "payment_transactions": [
+        {
+            "name": "completed_amount_positive",
+            "description": "Completed transactions must have amount > 0",
+            "check": lambda df: (
+                (df.get("status") == "COMPLETED") &
+                (pd.to_numeric(
+                    df.get("amount", 1), errors="coerce"
+                ) <= 0)
+            ) if "status" in df.columns and "amount" in df.columns
+              else pd.Series(False, index=df.index),
+        },
+        {
+            "name": "no_future_transaction_date",
+            "description": "Transaction date cannot be in the future",
+            "check": lambda df: (
+                pd.to_datetime(
+                    df["transaction_date"], errors="coerce"
+                ) > datetime.now()
+            ) if "transaction_date" in df.columns
+              else pd.Series(False, index=df.index),
+        },
+    ],
+    "trade_records": [
+        {
+            "name": "settlement_after_trade",
+            "description": "Settlement date must be >= trade date",
+            "check": lambda df: (
+                pd.to_datetime(df["settlement_date"], errors="coerce") <
+                pd.to_datetime(df["trade_date"],       errors="coerce")
+            ) if (
+                "settlement_date" in df.columns and
+                "trade_date"      in df.columns
+            ) else pd.Series(False, index=df.index),
+        },
+    ],
+}
+
+
+class QualityScorer:
+
+    def __init__(
+        self,
+        feed_name:         str,
+        profile_selection: ProfileSelection,
+    ):
+        self.feed_name  = feed_name
+        self.selection  = profile_selection
+        self.weights    = profile_selection.profile["weights"]
+        self.thresholds = profile_selection.profile["thresholds"]
+        self.cfg        = load_scoring_config()
+        self.alert_cfg  = self.cfg.get("alert_thresholds", {})
+
+    def compute(
+        self,
+        detection:       DetectionResult,
+        df:              pd.DataFrame,
+        history:         list[float] | None = None,
+        timestamp_field: str = "Prompt",
+    ) -> QualityScoreResult:
+
+        completeness = self._completeness(detection)
+        accuracy     = self._accuracy(detection)
+        consistency  = self._consistency(df)
+        freshness    = self._freshness(df, timestamp_field)
+
+        overall = round(min(100.0, max(0.0,
+            completeness.weighted + accuracy.weighted +
+            consistency.weighted  + freshness.weighted
+        )), 2)
+
+        all_scores = self._score_all_profiles(
+            completeness.score, accuracy.score,
+            consistency.score, freshness.score,
+        )
+
+        alert, msg = self._check_alerts(
+            completeness.score, overall, history or []
+        )
+        trend = round(overall - history[-1], 2) if history else None
+
+        return QualityScoreResult(
+            feed_name=self.feed_name,
+            run_timestamp=detection.run_timestamp,
+            total_rows=detection.total_rows,
+            profile_name=self.selection.profile_name,
+            profile_reasoning=self.selection.reasoning,
+            completeness=completeness,
+            accuracy=accuracy,
+            consistency=consistency,
+            freshness=freshness,
+            overall_score=overall,
+            grade=self._grade(overall),
+            alert_triggered=alert,
+            alert_message=msg,
+            trend_delta=trend,
+            score_history=(history or []) + [overall],
+            all_profile_scores=all_scores,
+        )
+
+    def _completeness(self, detection: DetectionResult) -> DimensionScore:
+        feed_rules  = get_feed_rules(self.feed_name)
+        field_rules = feed_rules.get("field_rules", {})
+        required    = feed_rules.get("required_fields", [])
+        imp         = self.cfg.get("impact_multipliers", {
+            "critical": 3.0, "high": 2.0,
+            "medium": 1.5, "low": 1.0,
+        })
+        scores, w_sum, viols = [], 0.0, 0
+
+        for fname in required:
+            rule   = field_rules.get(fname, {})
+            weight = imp.get(rule.get("downstream_impact", "medium"), 1.0)
+            if fname in detection.missing_columns:
+                field_score = 0.0
+                viols += 1
+            else:
+                nv = [
+                    v for v in detection.violations
+                    if v.field_name == fname
+                    and v.violation_type == "null_value"
+                ]
+                field_score = (
+                    (1.0 - nv[0].null_rate) * 100 if nv else 100.0
+                )
+                if nv:
+                    viols += nv[0].affected_count
+            scores.append(field_score * weight)
+            w_sum += weight
+
+        raw      = round(
+            min(100.0, sum(scores) / w_sum if w_sum else 100.0), 2
+        )
+        weighted = round(raw * self.weights["completeness"], 2)
+        return DimensionScore(
+            "Completeness", raw,
+            self.weights["completeness"], weighted,
+            f"{len(required) - viols}/{len(required)} "
+            f"required fields fully populated.",
+            viols,
+        )
+
+    def _accuracy(self, detection: DetectionResult) -> DimensionScore:
+        acc_types = {
+            "invalid_format",
+            "out_of_range_below_min",
+            "out_of_range_above_max",
+            "invalid_enum",
+            "duplicate_value",
+            "invalid_date_format",
+            "unparseable_date",
+        }
+        acc_viols = [
+            v for v in detection.violations
+            if v.violation_type in acc_types
+        ]
+        if not acc_viols or detection.total_rows == 0:
+            return DimensionScore(
+                "Accuracy", 100.0,
+                self.weights["accuracy"],
+                round(100.0 * self.weights["accuracy"], 2),
+                "No accuracy violations detected.", 0,
+            )
+        all_bad  = set(r for v in acc_viols for r in v.affected_rows)
+        score    = round(
+            (1.0 - len(all_bad) / detection.total_rows) * 100, 2
+        )
+        weighted = round(score * self.weights["accuracy"], 2)
+        return DimensionScore(
+            "Accuracy", score,
+            self.weights["accuracy"], weighted,
+            f"{len(all_bad)} row(s) failed accuracy checks "
+            f"across {len(acc_viols)} violation type(s).",
+            len(all_bad),
+        )
+
+    def _consistency(self, df: pd.DataFrame) -> DimensionScore:
+        rules = CONSISTENCY_RULES.get(self.feed_name, [])
+        if not rules or len(df) == 0:
+            return DimensionScore(
+                "Consistency", 100.0,
+                self.weights["consistency"],
+                round(100.0 * self.weights["consistency"], 2),
+                "No cross-field rules defined for this feed.", 0,
+            )
+        violated, triggered = set(), []
+        for rule in rules:
+            try:
+                mask = rule["check"](df).fillna(False)
+                bad  = mask[mask].index.tolist()
+                if bad:
+                    violated.update(bad)
+                    triggered.append(rule["name"])
+            except Exception:
+                pass
+        score    = round((1.0 - len(violated) / len(df)) * 100, 2)
+        weighted = round(score * self.weights["consistency"], 2)
+        details  = (
+            f"{len(violated)} row(s) failed consistency checks. "
+            + (
+                f"Rules triggered: {', '.join(triggered)}."
+                if triggered else "All rules passed."
+            )
+        )
+        return DimensionScore(
+            "Consistency", score,
+            self.weights["consistency"], weighted,
+            details, len(violated),
+        )
+
+    def _freshness(
+        self, df: pd.DataFrame, ts_field: str
+    ) -> DimensionScore:
+        sla_hours  = self.cfg.get(
+            "freshness_sla", {}
+        ).get(self.feed_name, 24)
+        cutoff     = datetime.now() - timedelta(hours=sla_hours)
+        candidates = [
+            ts_field, "Prompt", "transaction_date",
+            "trade_date", "open_date", "created_at",
+        ]
+        used_col = next(
+            (c for c in candidates if c in df.columns), None
+        )
+        if used_col is None:
+            return DimensionScore(
+                "Freshness", 75.0,
+                self.weights["freshness"],
+                round(75.0 * self.weights["freshness"], 2),
+                "No timestamp column found. Score set conservatively.", 0,
+            )
+        parsed   = pd.to_datetime(df[used_col], errors="coerce")
+        stale    = int((parsed < cutoff).sum())
+        score    = round(
+            (1.0 - stale / max(len(df), 1)) * 100, 2
+        )
+        weighted = round(score * self.weights["freshness"], 2)
+        return DimensionScore(
+            "Freshness", score,
+            self.weights["freshness"], weighted,
+            f"SLA={sla_hours}h. {stale} stale record(s). "
+            f"Oldest: {parsed.min()}. Newest: {parsed.max()}.",
+            stale,
+        )
+
+    def _score_all_profiles(
+        self, comp: float, acc: float,
+        cons: float, fresh: float,
+    ) -> dict:
+        try:
+            import yaml
+            from pathlib import Path
+            pf = (
+                Path(__file__).resolve().parent.parent /
+                "config" / "scoring_profiles.yaml"
+            )
+            profiles = (
+                yaml.safe_load(pf.read_text()).get("profiles", {})
+            )
+            result = {}
+            for name, prof in profiles.items():
+                w = prof.get("weights", {})
+                s = round(
+                    comp  * w.get("completeness", 0.35) +
+                    acc   * w.get("accuracy",     0.30) +
+                    cons  * w.get("consistency",  0.20) +
+                    fresh * w.get("freshness",    0.15),
+                    1,
+                )
+                result[name] = s
+            return result
+        except Exception:
+            return {}
+
+    def _grade(self, score: float) -> str:
+        t = self.thresholds
+        if score >= t["excellent"]:  return "Excellent"
+        if score >= t["good"]:       return "Good"
+        if score >= t["acceptable"]: return "Acceptable"
+        if score >= t["poor"]:       return "Poor"
+        return "CRITICAL"
+
+    def _check_alerts(
+        self,
+        comp:    float,
+        overall: float,
+        history: list[float],
+    ) -> tuple[bool, str]:
+        fc   = self.alert_cfg.get(self.feed_name, {})
+        msgs = []
+        if comp    < fc.get("completeness", 90):
+            msgs.append(f"Completeness {comp:.1f}% below threshold")
+        if overall < fc.get("overall", 80):
+            msgs.append(f"Overall {overall:.1f} below threshold")
+        if len(history) >= 3:
+            avg  = sum(history[-3:]) / 3
+            drop = avg - overall
+            if drop > 5.0:
+                msgs.append(
+                    f"Score dropped {drop:.1f} pts vs "
+                    f"3-run average ({avg:.1f} → {overall:.1f})"
+                )
+        return bool(msgs), " | ".join(msgs)
+
+
+"""
+impact.py — Downstream Impact Estimator
+Uses root cause chain from root_cause.py.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from .detector import DetectionResult, FieldViolation
+
+
+@dataclass
+class ImpactItem:
+    field_name:          str
+    violation_type:      str
+    affected_rows:       int
+    affected_pct:        float
+    source_lines:        list[int]
+    downstream_systems:  list[str]
+    impacted_processes:  list[str]
+    business_risks:      list[str]
+    impact_level:        str
+    root_cause_title:    str
+    fix_priority:        int
+    prevention:          str
+
+
+@dataclass
+class ImpactReport:
+    feed_name:           str
+    total_rows:          int
+    total_critical_rows: int
+    items:               list[ImpactItem] = field(default_factory=list)
+    blocked_systems:     list[str]        = field(default_factory=list)
+    overall_risk_level:  str              = "Low"
+    executive_summary:   str              = ""
+
+
+class ImpactEstimator:
+
+    def __init__(self, feed_name: str):
+        self.feed_name = feed_name
+
+    def estimate(self, detection: DetectionResult) -> ImpactReport:
+        items       = []
+        blocked_sys = set()
+        priority    = 1
+
+        sorted_viols = sorted(
+            detection.violations,
+            key=lambda v: (
+                {"critical":0,"high":1,"medium":2,"low":3}.get(
+                    v.downstream_impact, 2
+                ),
+                -v.affected_count,
+            ),
+        )
+
+        for v in sorted_viols:
+            blocked_sys.update(v.impacted_systems)
+            items.append(ImpactItem(
+                field_name=v.field_name,
+                violation_type=v.violation_type,
+                affected_rows=v.affected_count,
+                affected_pct=round(
+                    v.affected_count / max(detection.total_rows, 1) * 100,
+                    2,
+                ),
+                source_lines=v.source_lines,
+                downstream_systems=v.impacted_systems,
+                impacted_processes=v.impacted_processes,
+                business_risks=v.business_risks,
+                impact_level=v.downstream_impact,
+                root_cause_title=v.root_cause_title,
+                fix_priority=priority,
+                prevention=v.prevention,
+            ))
+            priority += 1
+
+        return ImpactReport(
+            feed_name=self.feed_name,
+            total_rows=detection.total_rows,
+            total_critical_rows=len(detection.critical_rows),
+            items=items,
+            blocked_systems=sorted(blocked_sys),
+            overall_risk_level=self._risk(detection),
+            executive_summary=self._summary(detection, items, blocked_sys),
+        )
+
+    def _risk(self, d: DetectionResult) -> str:
+        if d.critical_violation_count > 0: return "CRITICAL"
+        high = sum(
+            1 for v in d.violations if v.downstream_impact == "high"
+        )
+        if high >= 3: return "High"
+        if high >= 1: return "Medium"
+        return "Low"
+
+    def _summary(
+        self, d: DetectionResult,
+        items: list, blocked_sys: set,
+    ) -> str:
+        if not d.violations:
+            return (
+                f"Feed '{self.feed_name}' passed all quality checks. "
+                f"No systems at risk."
+            )
+        top = [i for i in items if i.impact_level == "critical"][:3]
+        top_str = "; ".join(
+            f"{i.field_name} ({i.affected_rows} rows)" for i in top
+        )
+        return (
+            f"Feed '{self.feed_name}' — "
+            f"{d.total_violations} violation(s) across "
+            f"{d.total_rows:,} records. "
+            f"{d.critical_violation_count} critical violation(s). "
+            f"{len(d.critical_rows)} row(s) completely blocked. "
+            f"{len(blocked_sys)} downstream system(s) at risk. "
+            f"Top issues: {top_str}."
+        )
+
+
+
+"""
+reporter.py
+===========
+Full HTML Webpage Report Generator — Final Version.
+
+Sections:
+  1. File metadata bar
+  2. Score cards + profile selected
+  3. Profile selection explanation + comparison table
+  4. Dimension bars
+  5. Violation detail — per violation:
+       exact line numbers | violation type | root cause |
+       likely origins | downstream systems | business risks | prevention
+  6. Downstream impact chain table
+  7. Executive summary
+"""
+
+from __future__ import annotations
+from datetime import datetime
+from pathlib import Path
+import pandas as pd
+
+from .detector import DetectionResult
+from .scorer   import QualityScoreResult
+from .impact   import ImpactReport
+
+BASE_DIR    = Path(__file__).resolve().parent.parent
+REPORTS_DIR = BASE_DIR / "reports"
+REPORTS_DIR.mkdir(exist_ok=True)
+
+
+class ReportGenerator:
+
+    def daily_report(
+        self,
+        score:     QualityScoreResult,
+        detection: DetectionResult,
+        impact:    ImpactReport,
+        meta:      dict | None = None,
+    ) -> Path:
+        html  = self._build_html(score, detection, impact, meta or {})
+        fname = (
+            REPORTS_DIR /
+            f"daily_{detection.feed_name}_"
+            f"{score.run_timestamp.strftime('%Y%m%d_%H%M')}.html"
+        )
+        fname.write_text(html, encoding="utf-8")
+        return fname
+
+    def weekly_report(self, weekly_data: list[dict]) -> Path:
+        df   = pd.DataFrame(weekly_data)
+        rows = ""
+        for _, row in df.iterrows():
+            s = row["overall"]
+            c = (
+                "#16A34A" if s >= 85 else
+                "#D97706" if s >= 70 else "#DC2626"
+            )
+            rows += (
+                f"<tr><td>{row['feed']}</td><td>{row['date']}</td>"
+                f"<td style='color:{c};font-weight:700'>{s:.1f}</td>"
+                f"<td>{row['completeness']:.1f}</td>"
+                f"<td>{row['accuracy']:.1f}</td>"
+                f"<td>{row['consistency']:.1f}</td>"
+                f"<td>{row['freshness']:.1f}</td></tr>"
+            )
+        html = f"""<!DOCTYPE html><html lang="en">
+<head><meta charset="UTF-8">
+<title>Weekly Quality Summary</title>
+{self._styles()}</head><body>
+{self._header(
+    "Weekly Quality Summary Report",
+    datetime.now().strftime("%Y-%m-%d %H:%M"),
+)}
+<div class="container">
+<h2>7-Day Quality Summary</h2>
+<table>
+<thead><tr>
+  <th>Feed</th><th>Date</th><th>Overall</th>
+  <th>Completeness</th><th>Accuracy</th>
+  <th>Consistency</th><th>Freshness</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+{self._footer()}</body></html>"""
+        fname = (
+            REPORTS_DIR /
+            f"weekly_summary_{datetime.now().strftime('%Y%m%d')}.html"
+        )
+        fname.write_text(html, encoding="utf-8")
+        return fname
+
+    # ── Main HTML builder ─────────────────────────────────────────────────
+
+    def _build_html(
+        self,
+        score:     QualityScoreResult,
+        detection: DetectionResult,
+        impact:    ImpactReport,
+        meta:      dict,
+    ) -> str:
+
+        grade_colour = {
+            "Excellent": "#16A34A", "Good": "#2563EB",
+            "Acceptable": "#D97706", "Poor": "#DC2626",
+            "CRITICAL": "#7C2D12",
+        }.get(score.grade, "#374151")
+
+        trend_html = ""
+        if score.trend_delta is not None:
+            a = "▲" if score.trend_delta >= 0 else "▼"
+            c = "#16A34A" if score.trend_delta >= 0 else "#DC2626"
+            trend_html = (
+                f"<span style='color:{c};font-size:0.85rem;'>"
+                f"{a} {abs(score.trend_delta):.1f} pts vs prev</span>"
+            )
+
+        alert_html = ""
+        if score.alert_triggered:
+            alert_html = f"""
+<div class="alert-banner">
+  <div class="alert-title">&#9888; QUALITY ALERT</div>
+  <div>{score.alert_message}</div>
+</div>"""
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DQ Report — {detection.feed_name} — {score.run_timestamp.strftime('%Y-%m-%d')}</title>
+{self._styles()}
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-brand">
+    <div style="font-weight:700;">DQ Report</div>
+    <div style="opacity:.65;font-size:0.75rem;margin-top:2px;">
+      {detection.feed_name}
+    </div>
+  </div>
+  <div class="sidebar-section">Navigation</div>
+  <a href="#overview">Overview</a>
+  <a href="#profile">Scoring Profile</a>
+  <a href="#dimensions">Dimensions</a>
+  <a href="#violations">Violations</a>
+  <a href="#impact">Impact Chain</a>
+  <a href="#summary">Summary</a>
+  <div style="position:absolute;bottom:12px;left:0;right:0;
+              padding:0 16px;font-size:0.68rem;opacity:.45;">
+    {score.run_timestamp.strftime('%Y-%m-%d %H:%M')}
+  </div>
+</nav>
+
+<div class="main">
+{self._header(
+    f"Data Quality Report — {detection.feed_name}",
+    score.run_timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+    f"{detection.total_rows:,} rows &nbsp;|&nbsp; "
+    f"{detection.total_violations} violations &nbsp;|&nbsp; "
+    f"Risk: {impact.overall_risk_level}",
+)}
+
+<div class="container">
+  {alert_html}
+  {self._file_meta_bar(meta, detection)}
+
+  <section id="overview">
+    <h2>Overview</h2>
+    {self._score_cards(score, grade_colour, trend_html)}
+  </section>
+
+  <section id="profile">
+    <h2>Scoring Profile Selected</h2>
+    {self._profile_section(score)}
+  </section>
+
+  <section id="dimensions">
+    <h2>Quality Dimensions</h2>
+    {self._dimension_bars(score)}
+  </section>
+
+  <section id="violations">
+    <h2>Violation Detail
+      <span style="font-size:0.8rem;font-weight:400;
+                   color:#6B7280;margin-left:8px;">
+        {detection.total_violations} total — click any row to expand
+      </span>
+    </h2>
+    {self._filter_bar()}
+    {self._violations_detail(detection)}
+  </section>
+
+  <section id="impact">
+    <h2>Downstream Impact Chain</h2>
+    {self._impact_table(impact)}
+  </section>
+
+  <section id="summary">
+    <h2>Executive Summary</h2>
+    <div class="card">{impact.executive_summary}</div>
+  </section>
+
+</div>
+{self._footer()}
+</div>
+
+<script>
+function filterViolations(q) {{
+  q = q.toLowerCase();
+  document.querySelectorAll('.vrow').forEach(r => {{
+    r.style.display =
+      r.textContent.toLowerCase().includes(q) ? '' : 'none';
+  }});
+}}
+function filterSev(level) {{
+  document.querySelectorAll('.vrow').forEach(r => {{
+    r.style.display =
+      (level === 'all' || r.dataset.sev === level) ? '' : 'none';
+  }});
+  document.querySelectorAll('.fbtn').forEach(b => {{
+    b.style.background = b.dataset.lv === level ? '#0033A0' : '#E5E7EB';
+    b.style.color      = b.dataset.lv === level ? 'white'   : '#374151';
+  }});
+}}
+</script>
+</body></html>"""
+
+    # ── Sections ──────────────────────────────────────────────────────────
+
+    def _file_meta_bar(
+        self, meta: dict, detection: DetectionResult
+    ) -> str:
+        fn  = meta.get("filename", detection.source_file)
+        fmt = meta.get("format", "unknown")
+        sz  = meta.get("size_kb", "?")
+        return f"""
+<div class="meta-bar">
+  <span>&#128196; <strong>File:</strong> {fn}</span>
+  <span>&#128230; <strong>Format:</strong> {fmt}</span>
+  <span>&#128190; <strong>Size:</strong> {sz} KB</span>
+  <span>&#128202; <strong>Rows:</strong> {detection.total_rows:,}</span>
+  <span>&#9888; <strong>Violations:</strong>
+    {detection.total_violations}</span>
+  <span>&#128308; <strong>Critical Rows:</strong>
+    {len(detection.critical_rows)}</span>
+</div>"""
+
+    def _score_cards(
+        self,
+        score:        QualityScoreResult,
+        grade_colour: str,
+        trend_html:   str,
+    ) -> str:
+        cards = f"""
+<div class="score-band">
+  <div class="score-card">
+    <div class="label">Overall Score</div>
+    <div class="value" style="color:{grade_colour}">
+      {score.overall_score:.1f}
+    </div>
+    <div class="sub">
+      <strong>{score.grade}</strong> &nbsp; {trend_html}
+    </div>
+  </div>"""
+        for dim in [
+            score.completeness, score.accuracy,
+            score.consistency,  score.freshness,
+        ]:
+            c = (
+                "#16A34A" if dim.score >= 90 else
+                "#D97706" if dim.score >= 70 else "#DC2626"
+            )
+            cards += f"""
+  <div class="score-card">
+    <div class="label">{dim.name}</div>
+    <div class="value" style="color:{c}">{dim.score:.1f}</div>
+    <div class="sub">Weight {int(dim.weight*100)}%
+      &nbsp; {dim.violations} issue(s)</div>
+  </div>"""
+        cards += f"""
+  <div class="score-card">
+    <div class="label">Profile</div>
+    <div class="value" style="font-size:1.1rem;color:#0033A0;">
+      {score.profile_name}
+    </div>
+    <div class="sub">auto-selected</div>
+  </div>
+</div>"""
+        return cards
+
+    def _profile_section(self, score: QualityScoreResult) -> str:
+        reasoning_html = "".join(
+            f"<li style='margin-bottom:4px;'>{r}</li>"
+            for r in score.profile_reasoning
+        )
+        comp_rows = ""
+        for pname, pscore in score.all_profile_scores.items():
+            highlight = (
+                "background:#EEF2FF;"
+                if pname == score.profile_name else ""
+            )
+            c = (
+                "#16A34A" if pscore >= 85 else
+                "#D97706" if pscore >= 70 else "#DC2626"
+            )
+            sel = (
+                " <span class='badge b-medium'>selected</span>"
+                if pname == score.profile_name else ""
+            )
+            comp_rows += (
+                f"<tr style='{highlight}'>"
+                f"<td class='mono'>{pname}{sel}</td>"
+                f"<td class='mono' style='color:{c};"
+                f"font-weight:700;'>{pscore}</td></tr>"
+            )
+        return f"""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+  <div class="card">
+    <strong>Why '{score.profile_name}' was selected:</strong>
+    <ul style="margin-top:10px;padding-left:18px;
+               font-size:0.85rem;line-height:1.8;">
+      {reasoning_html}
+    </ul>
+  </div>
+  <div>
+    <p style="font-size:0.85rem;color:#6B7280;margin-bottom:10px;">
+      Score under each profile (same data, different weights):
+    </p>
+    <table>
+      <thead><tr><th>Profile</th><th>Score</th></tr></thead>
+      <tbody>{comp_rows}</tbody>
+    </table>
+  </div>
+</div>"""
+
+    def _dimension_bars(self, score: QualityScoreResult) -> str:
+        html = "<div style='max-width:700px;'>"
+        for dim in [
+            score.completeness, score.accuracy,
+            score.consistency,  score.freshness,
+        ]:
+            c = (
+                "#16A34A" if dim.score >= 90 else
+                "#D97706" if dim.score >= 70 else "#DC2626"
+            )
+            html += f"""
+<div style="margin-bottom:22px;">
+  <div style="display:flex;justify-content:space-between;
+              margin-bottom:6px;">
+    <span style="font-weight:600;font-size:0.88rem;">{dim.name}
+      <span style="font-weight:400;color:#6B7280;font-size:0.8rem;">
+        &nbsp;— {dim.details}
+      </span>
+    </span>
+    <span class="mono" style="font-weight:700;color:{c};">
+      {dim.score:.1f}
+    </span>
+  </div>
+  <div style="background:#E5E7EB;border-radius:6px;height:14px;">
+    <div style="background:{c};width:{dim.score}%;height:14px;
+                border-radius:6px;"></div>
+  </div>
+</div>"""
+        return html + "</div>"
+
+    def _filter_bar(self) -> str:
+        return """
+<div style="display:flex;gap:8px;align-items:center;
+            margin-bottom:16px;flex-wrap:wrap;">
+  <input type="text" placeholder="Search violations..."
+    oninput="filterViolations(this.value)"
+    style="padding:8px 12px;border:1px solid #DDE3F0;
+           border-radius:6px;font-size:0.84rem;flex:1;
+           min-width:200px;">
+  <button class="fbtn" data-lv="all"
+    onclick="filterSev('all')"
+    style="padding:7px 14px;border:none;border-radius:6px;
+           background:#0033A0;color:white;cursor:pointer;
+           font-size:0.8rem;">All</button>
+  <button class="fbtn" data-lv="critical"
+    onclick="filterSev('critical')"
+    style="padding:7px 14px;border:none;border-radius:6px;
+           background:#E5E7EB;color:#374151;cursor:pointer;
+           font-size:0.8rem;">Critical</button>
+  <button class="fbtn" data-lv="high"
+    onclick="filterSev('high')"
+    style="padding:7px 14px;border:none;border-radius:6px;
+           background:#E5E7EB;color:#374151;cursor:pointer;
+           font-size:0.8rem;">High</button>
+  <button class="fbtn" data-lv="medium"
+    onclick="filterSev('medium')"
+    style="padding:7px 14px;border:none;border-radius:6px;
+           background:#E5E7EB;color:#374151;cursor:pointer;
+           font-size:0.8rem;">Medium</button>
+</div>"""
+
+    def _violations_detail(self, detection: DetectionResult) -> str:
+        if not detection.violations:
+            return """<div class="card" style="color:#16A34A;
+                       font-weight:600;">
+              &#10003; No violations detected.</div>"""
+
+        html = ""
+        for v in detection.violations:
+            badge_cls = f"b-{v.downstream_impact}"
+            vtype     = v.violation_type.replace("_", " ").title()
+
+            # Line number chips (max 30 shown)
+            chips = "".join(
+                f"<span class='chip {v.downstream_impact}'>"
+                f"Line {ln}</span>"
+                for ln in v.source_lines[:30]
+            )
+            if len(v.source_lines) > 30:
+                chips += (
+                    f"<span class='chip'>"
+                    f"+{len(v.source_lines)-30} more</span>"
+                )
+
+            # Sample bad values
+            samples_html = ""
+            if v.sample_bad_values:
+                vals = "".join(
+                    f"<code style='background:#FEE2E2;"
+                    f"padding:2px 6px;border-radius:4px;"
+                    f"margin:2px;display:inline-block;"
+                    f"font-size:0.78rem;'>{val}</code>"
+                    for val in v.sample_bad_values[:5]
+                )
+                samples_html = (
+                    f"<div style='margin-top:8px;'>"
+                    f"<strong style='font-size:0.8rem;'>"
+                    f"Sample bad values:</strong>"
+                    f"<div style='margin-top:4px;'>{vals}</div></div>"
+                )
+
+            # Likely origins
+            origins_html = ""
+            if v.likely_origins:
+                origins_html = (
+                    "<ul style='margin:6px 0 0 16px;"
+                    "font-size:0.8rem;color:#4B5563;line-height:1.7;'>"
+                    + "".join(f"<li>{o}</li>" for o in v.likely_origins)
+                    + "</ul>"
+                )
+
+            # Business risks
+            risks_html = ""
+            if v.business_risks:
+                risks_html = (
+                    "<ul style='margin:6px 0 0 16px;"
+                    "font-size:0.8rem;color:#991B1B;line-height:1.7;'>"
+                    + "".join(
+                        f"<li>&#9888; {r}</li>"
+                        for r in v.business_risks
+                    )
+                    + "</ul>"
+                )
+
+            # Impacted systems
+            sys_html = ""
+            if v.impacted_systems:
+                sys_html = (
+                    "<div style='margin-top:6px;'>"
+                    + "".join(
+                        f"<span style='background:#EEF2FF;"
+                        f"color:#3730A3;padding:2px 8px;"
+                        f"border-radius:10px;font-size:0.75rem;"
+                        f"margin:2px;display:inline-block;'>{s}</span>"
+                        for s in v.impacted_systems
+                    )
+                    + "</div>"
+                )
+
+            html += f"""
+<details class="vrow" data-sev="{v.downstream_impact}">
+  <summary>
+    <div style="display:flex;align-items:center;gap:10px;
+                flex:1;flex-wrap:wrap;">
+      <span class="mono" style="font-weight:700;min-width:150px;">
+        {v.field_name}
+      </span>
+      <span class="badge {badge_cls}">{v.downstream_impact}</span>
+      <code style="background:#F3F4F6;padding:2px 8px;
+                   border-radius:4px;font-size:0.78rem;">
+        {vtype}
+      </code>
+      <span style="font-size:0.78rem;color:#6B7280;">
+        {v.root_cause_category}
+      </span>
+    </div>
+    <div class="mono" style="color:#DC2626;font-weight:700;
+                              font-size:0.85rem;white-space:nowrap;">
+      {v.affected_count:,} / {v.total_rows:,} rows
+      ({v.null_rate*100:.1f}%)
+    </div>
+  </summary>
+
+  <div class="detail-body">
+    <div class="detail-grid">
+
+      <div class="detail-col">
+        <div class="detail-label">&#128204; Exact File Lines</div>
+        <div class="chip-wrap">{chips}</div>
+        {samples_html}
+      </div>
+
+      <div class="detail-col">
+        <div class="detail-label">&#128269; Root Cause</div>
+        <div style="font-weight:600;font-size:0.88rem;
+                    margin-bottom:4px;">
+          {v.root_cause_title}
+        </div>
+        <div style="font-size:0.82rem;color:#4B5563;line-height:1.6;">
+          {v.root_cause_explanation}
+        </div>
+      </div>
+
+      <div class="detail-col">
+        <div class="detail-label">&#128994; Likely Origins</div>
+        {origins_html or
+         '<div style="font-size:0.8rem;color:#6B7280;">Not mapped</div>'}
+      </div>
+
+      <div class="detail-col">
+        <div class="detail-label">&#9940; Blocked Systems</div>
+        {sys_html or
+         '<div style="font-size:0.8rem;color:#6B7280;">None mapped</div>'}
+        <div style="margin-top:8px;font-size:0.8rem;color:#6B7280;">
+          <strong>Processes:</strong>
+          {', '.join(v.impacted_processes)
+           if v.impacted_processes else 'Not mapped'}
+        </div>
+      </div>
+
+      <div class="detail-col">
+        <div class="detail-label">&#128308; Business Risks</div>
+        {risks_html or
+         '<div style="font-size:0.8rem;color:#6B7280;">None mapped</div>'}
+      </div>
+
+      <div class="detail-col">
+        <div class="detail-label">&#9989; Prevention</div>
+        <div style="font-size:0.82rem;color:#065F46;line-height:1.6;">
+          {v.prevention}
+        </div>
+        <div style="margin-top:8px;font-size:0.8rem;color:#374151;
+                    border-top:1px solid #E5E7EB;padding-top:8px;">
+          <strong>Fill strategy:</strong> {v.fill_detail}
+        </div>
+      </div>
+
+    </div>
+  </div>
+</details>"""
+
+        return html
+
+    def _impact_table(self, impact: ImpactReport) -> str:
+        if not impact.items:
+            return "<div class='card'>No impact items.</div>"
+
+        rows = ""
+        for item in impact.items:
+            lines_str = ", ".join(
+                f"L{l}" for l in item.source_lines[:5]
+            )
+            if len(item.source_lines) > 5:
+                lines_str += f" +{len(item.source_lines)-5}"
+
+            risks_html = "".join(
+                f"<div style='font-size:0.75rem;color:#991B1B;"
+                f"margin-top:2px;'>&#9888; {r}</div>"
+                for r in item.business_risks[:2]
+            )
+
+            rows += f"""
+<tr>
+  <td class="mono"><strong>P{item.fix_priority}</strong></td>
+  <td class="mono">{item.field_name}</td>
+  <td class="mono">{item.affected_rows:,}
+    <span style="color:#6B7280;">({item.affected_pct}%)</span></td>
+  <td class="mono" style="color:#7C3AED;font-size:0.78rem;">
+    {lines_str}</td>
+  <td style="font-size:0.8rem;">
+    {', '.join(item.downstream_systems[:3])}</td>
+  <td>{risks_html}</td>
+  <td style="font-size:0.78rem;color:#065F46;max-width:180px;">
+    {(item.prevention or '')[:100]}...</td>
+</tr>"""
+
+        return f"""
+<table>
+  <thead>
+    <tr>
+      <th>Priority</th><th>Field</th><th>Rows</th>
+      <th>File Lines</th><th>Blocked Systems</th>
+      <th>Business Risks</th><th>Prevention</th>
+    </tr>
+  </thead>
+  <tbody>{rows}</tbody>
+</table>"""
+
+    # ── Shared HTML ───────────────────────────────────────────────────────
+
+    def _header(
+        self, title: str,
+        timestamp: str = "", subtitle: str = "",
+    ) -> str:
+        return f"""
+<header>
+  <div>
+    <div style="font-size:0.72rem;opacity:.65;margin-bottom:3px;
+                font-family:monospace;">
+      DEUTSCHE BANK — DATA QUALITY AGENT
+    </div>
+    <h1>{title}</h1>
+    {f'<div style="margin-top:4px;opacity:.85;font-size:0.85rem;">{subtitle}</div>'
+     if subtitle else ''}
+  </div>
+  <div class="meta">{timestamp}</div>
+</header>"""
+
+    def _footer(self) -> str:
+        return f"""
+<footer>
+  Data Quality Agent &mdash;
+  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &mdash;
+  Deutsche Bank Internship Project
+</footer>"""
+
+    def _styles(self) -> str:
+        return """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
+:root{
+  --db-blue:#0033A0;--db-gold:#FFD700;--db-red:#C8102E;
+  --bg:#F4F6FB;--card:#FFFFFF;--border:#DDE3F0;
+  --text:#1A1A2E;--muted:#6B7280;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html{scroll-behavior:smooth;}
+body{font-family:'IBM Plex Sans',sans-serif;
+     background:var(--bg);color:var(--text);}
+.sidebar{position:fixed;left:0;top:0;bottom:0;width:210px;
+         background:var(--db-blue);color:white;
+         overflow-y:auto;z-index:100;}
+.sidebar-brand{padding:20px 16px;
+               border-bottom:1px solid rgba(255,255,255,.12);
+               margin-bottom:8px;}
+.sidebar-section{padding:4px 16px;font-size:0.68rem;
+                 text-transform:uppercase;letter-spacing:1px;
+                 opacity:.5;margin-top:8px;}
+.sidebar a{display:block;padding:9px 16px;
+           color:rgba(255,255,255,.82);text-decoration:none;
+           font-size:0.84rem;border-left:3px solid transparent;
+           transition:all .15s;}
+.sidebar a:hover{background:rgba(255,255,255,.08);
+                 border-left-color:var(--db-gold);color:white;}
+.main{margin-left:210px;}
+header{background:var(--db-blue);color:white;padding:22px 36px;
+       display:flex;justify-content:space-between;align-items:center;}
+header h1{font-size:1.3rem;font-weight:700;}
+.meta{font-size:0.8rem;opacity:.8;
+      font-family:'IBM Plex Mono',monospace;text-align:right;}
+.container{max-width:1100px;margin:0 auto;padding:28px 32px;}
+section{margin-bottom:44px;}
+h2{font-size:1rem;font-weight:700;color:var(--db-blue);
+   border-bottom:2px solid var(--db-blue);
+   padding-bottom:7px;margin-bottom:18px;}
+.meta-bar{background:#EEF2FF;border:1px solid #C7D2FE;
+          border-radius:6px;padding:11px 16px;margin-bottom:24px;
+          font-size:0.82rem;font-family:monospace;color:#3730A3;
+          display:flex;flex-wrap:wrap;gap:16px;}
+.score-band{display:grid;
+            grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+            gap:12px;margin-bottom:24px;}
+.score-card{background:var(--card);border:1px solid var(--border);
+            border-radius:8px;padding:16px;}
+.score-card .label{font-size:0.7rem;text-transform:uppercase;
+                   letter-spacing:1px;color:var(--muted);margin-bottom:6px;}
+.score-card .value{font-size:2rem;font-weight:700;
+                   font-family:'IBM Plex Mono',monospace;}
+.score-card .sub{font-size:0.76rem;color:var(--muted);margin-top:3px;}
+.alert-banner{background:#FEF2F2;border:1px solid #FCA5A5;
+              border-left:4px solid var(--db-red);border-radius:6px;
+              padding:12px 16px;margin-bottom:20px;}
+.alert-title{font-weight:700;color:var(--db-red);margin-bottom:3px;}
+table{width:100%;border-collapse:collapse;background:var(--card);
+      border:1px solid var(--border);border-radius:8px;
+      overflow:hidden;margin-bottom:16px;}
+th{background:var(--db-blue);color:white;padding:9px 12px;
+   font-size:0.75rem;text-transform:uppercase;
+   letter-spacing:.5px;text-align:left;}
+td{padding:9px 12px;font-size:0.83rem;
+   border-bottom:1px solid var(--border);}
+tr:last-child td{border-bottom:none;}
+tr:hover td{background:#F0F4FF;}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;
+       font-size:0.7rem;font-weight:700;text-transform:uppercase;}
+.b-critical{background:#FEE2E2;color:#991B1B;}
+.b-high{background:#FEF3C7;color:#92400E;}
+.b-medium{background:#DBEAFE;color:#1E40AF;}
+.b-low{background:#D1FAE5;color:#065F46;}
+details.vrow{border:1px solid var(--border);border-radius:8px;
+             margin-bottom:8px;overflow:hidden;}
+details.vrow summary{padding:12px 16px;cursor:pointer;
+                     background:#F9FAFB;list-style:none;
+                     display:flex;justify-content:space-between;
+                     align-items:center;gap:12px;flex-wrap:wrap;}
+details.vrow summary:hover{background:#F0F4FF;}
+details[open].vrow summary{background:#EEF2FF;
+                            border-bottom:1px solid var(--border);}
+.detail-body{padding:16px 20px;background:white;}
+.detail-grid{display:grid;
+             grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+             gap:16px;}
+.detail-col{border:1px solid #E5E7EB;border-radius:6px;padding:12px;}
+.detail-label{font-size:0.7rem;text-transform:uppercase;
+              letter-spacing:.8px;color:var(--muted);
+              margin-bottom:8px;font-weight:600;}
+.chip-wrap{display:flex;flex-wrap:wrap;gap:4px;}
+.chip{background:#1E1B4B;color:white;padding:2px 7px;
+      border-radius:4px;font-family:monospace;font-size:0.75rem;}
+.chip.critical{background:#991B1B;}
+.chip.high{background:#92400E;}
+.chip.medium{background:#1E40AF;}
+.chip.low{background:#065F46;}
+.card{background:var(--card);border:1px solid var(--border);
+      border-radius:8px;padding:16px;line-height:1.7;
+      font-size:0.87rem;margin-bottom:16px;}
+.mono{font-family:'IBM Plex Mono',monospace;font-size:0.8rem;}
+footer{text-align:center;padding:20px;font-size:0.73rem;
+       color:var(--muted);border-top:1px solid var(--border);
+       margin-top:32px;}
+@media(max-width:768px){
+  .sidebar{display:none;} .main{margin-left:0;}
+}
+</style>"""
+
+
+def print_console_summary(score, detection, impact):
+    print(f"\n{'='*62}")
+    print(f"  Feed     : {detection.feed_name}")
+    print(f"  File     : {detection.source_file}")
+    print(f"  Profile  : {score.profile_name}")
+    print(f"  Score    : {score.overall_score:.1f}/100  [{score.grade}]")
+    print(f"  Risk     : {impact.overall_risk_level}")
+    print(
+        f"  Alert    : "
+        f"{'YES — ' + score.alert_message if score.alert_triggered else 'No'}"
+    )
+    print(f"{'─'*62}")
+    for dim in [
+        score.completeness, score.accuracy,
+        score.consistency,  score.freshness,
+    ]:
+        bar = "█" * int(dim.score/5) + "░" * (20 - int(dim.score/5))
+        print(f"  {dim.name:15s} {bar}  {dim.score:5.1f}")
+    print(f"{'─'*62}")
+    for v in detection.violations[:6]:
+        lines = str(v.source_lines[:3])[1:-1]
+        if len(v.source_lines) > 3:
+            lines += f"... +{len(v.source_lines)-3}"
+        print(
+            f"  [{v.downstream_impact.upper():8s}] "
+            f"{v.field_name:20s} "
+            f"{v.affected_count:5,} rows  "
+            f"lines: {lines}"
+        )
+    if detection.total_violations > 6:
+        print(f"  ... and {detection.total_violations - 6} more")
+    print(f"{'='*62}\n")
+
+
+
+
+
+"""
+agent.py — Main Orchestrator — Final Version
+"""
+
+from __future__ import annotations
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+
+from .file_loader       import FileLoader
+from .detector          import NullFieldDetector
+from .scoring_selector  import ScoringProfileSelector
+from .scorer            import QualityScorer
+from .impact            import ImpactEstimator
+from .reporter          import ReportGenerator, print_console_summary
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log          = logging.getLogger("dq_agent")
+BASE_DIR     = Path(__file__).resolve().parent.parent
+HISTORY_FILE = BASE_DIR / "reports" / "score_history.json"
+
+
+def _load_history(feed_name: str) -> list[float]:
+    if HISTORY_FILE.exists():
+        return (
+            json.loads(HISTORY_FILE.read_text())
+            .get(feed_name, [])[-30:]
+        )
+    return []
+
+
+def _save_history(feed_name: str, score: float):
+    data = (
+        json.loads(HISTORY_FILE.read_text())
+        if HISTORY_FILE.exists() else {}
+    )
+    data.setdefault(feed_name, []).append(round(score, 2))
+    data[feed_name] = data[feed_name][-30:]
+    HISTORY_FILE.write_text(json.dumps(data, indent=2))
+
+
+class DataQualityAgent:
+
+    def __init__(self):
+        self.loader      = FileLoader()
+        self.selector    = ScoringProfileSelector()
+        self.report_gen  = ReportGenerator()
+        self._weekly_buffer: list[dict] = []
+
+    def run_file(
+        self,
+        filepath:        str,
+        feed_name:       str,
+        timestamp_field: str  = "Prompt",
+        save_report:     bool = True,
+    ) -> dict:
+        """
+        Main entry point.
+        Auto-detects file format (CSV/TXT/JSON/Excel),
+        handles commas in fields, runs full pipeline.
+        """
+        log.info(f"[{feed_name}] Loading: {filepath}")
+        df, meta = self.loader.load(filepath)
+        log.info(
+            f"[{feed_name}] {len(df):,} rows | "
+            f"format: {meta['format']} | "
+            f"{len(meta['columns'])} columns"
+        )
+        return self.run_once(
+            df, feed_name, timestamp_field, save_report, meta
+        )
+
+    def run_once(
+        self,
+        df:              pd.DataFrame,
+        feed_name:       str,
+        timestamp_field: str  = "Prompt",
+        save_report:     bool = True,
+        meta:            dict | None = None,
+    ) -> dict:
+        meta = meta or {}
+
+        # 1. Detect
+        log.info(f"[{feed_name}] Scanning {len(df):,} rows...")
+        detector  = NullFieldDetector(feed_name)
+        detection = detector.scan(
+            df, source_file=meta.get("filename", "")
+        )
+        detection.file_format = meta.get("format", "")
+        log.info(
+            f"[{feed_name}] {detection.total_violations} violation(s) | "
+            f"{len(detection.critical_rows)} critical rows"
+        )
+
+        # 2. Auto-select scoring profile
+        selection = self.selector.select(df, feed_name, meta)
+        log.info(
+            f"[{feed_name}] Profile: {selection.profile_name} "
+            f"(confidence: {selection.confidence:.0%})"
+        )
+
+        # 3. Score
+        history = _load_history(feed_name)
+        scorer  = QualityScorer(feed_name, selection)
+        score   = scorer.compute(
+            detection, df,
+            history=history,
+            timestamp_field=timestamp_field,
+        )
+        _save_history(feed_name, score.overall_score)
+        log.info(
+            f"[{feed_name}] Score: {score.overall_score:.1f} "
+            f"({score.grade})"
+        )
+
+        # 4. Impact
+        estimator = ImpactEstimator(feed_name)
+        impact    = estimator.estimate(detection)
+        log.info(
+            f"[{feed_name}] Risk: {impact.overall_risk_level} | "
+            f"{len(impact.blocked_systems)} systems at risk"
+        )
+
+        # 5. Console summary
+        print_console_summary(score, detection, impact)
+
+        # 6. HTML report
+        report_path = None
+        if save_report:
+            report_path = self.report_gen.daily_report(
+                score, detection, impact, meta
+            )
+            log.info(f"[{feed_name}] Report: {report_path}")
+
+        # 7. Alert log
+        if score.alert_triggered:
+            self._log_alert(feed_name, score, detection, impact)
+
+        # 8. Weekly buffer
+        self._weekly_buffer.append({
+            "feed":         feed_name,
+            "date":         score.run_timestamp.strftime("%Y-%m-%d"),
+            "overall":      score.overall_score,
+            "completeness": score.completeness.score,
+            "accuracy":     score.accuracy.score,
+            "consistency":  score.consistency.score,
+            "freshness":    score.freshness.score,
+        })
+
+        return {
+            "score":       score,
+            "detection":   detection,
+            "impact":      impact,
+            "selection":   selection,
+            "report_path": report_path,
+            "meta":        meta,
+        }
+
+    def run_all_feeds(
+        self, feed_data: dict[str, pd.DataFrame]
+    ) -> dict:
+        return {
+            name: self.run_once(df, name)
+            for name, df in feed_data.items()
+        }
+
+    def generate_weekly_report(self) -> Path:
+        path = self.report_gen.weekly_report(self._weekly_buffer)
+        self._weekly_buffer.clear()
+        return path
+
+    def _log_alert(self, feed_name, score, detection, impact):
+        log_path = BASE_DIR / "reports" / "alerts.log"
+        with open(log_path, "a") as f:
+            f.write(
+                f"{datetime.now().isoformat()} | "
+                f"{feed_name} | "
+                f"PROFILE={score.profile_name} | "
+                f"SCORE={score.overall_score:.1f} | "
+                f"GRADE={score.grade} | "
+                f"RISK={impact.overall_risk_level} | "
+                f"CRITICAL_ROWS={len(detection.critical_rows)} | "
+                f"{score.alert_message}\n"
+            )
+
+
+
+"""
+watcher.py
+==========
+Real-Time File Watcher — Final Version.
+
+Monitors a folder. The moment a new file appears,
+the full quality scan runs automatically.
+
+No extra libraries needed — uses Python's built-in
+threading and polling. (watchdog is optional.)
+
+Usage:
+    python main.py --watch C:/data/incoming
+    python main.py --watch C:/data/incoming --feed otc_lme_positions
+"""
+
+from __future__ import annotations
+import logging
+import time
+import threading
+from datetime import datetime
+from pathlib import Path
+
+log = logging.getLogger("dq_watcher")
+
+# ── File → Feed mapping ───────────────────────────────────────────────────────
+# Maps filename keywords → (feed_name, timestamp_field).
+# Edit this to match your actual file naming conventions.
+
+FILE_FEED_MAP = {
+    "OTC_LME":  ("otc_lme_positions",    "Prompt"),
+    "LME":      ("otc_lme_positions",    "Prompt"),
+    "PAYMENT":  ("payment_transactions", "transaction_date"),
+    "TXN":      ("payment_transactions", "transaction_date"),
+    "TRADE":    ("trade_records",        "trade_date"),
+    "DEAL":     ("trade_records",        "trade_date"),
+    "ACCOUNT":  ("customer_accounts",   "open_date"),
+}
+
+SUPPORTED_EXTENSIONS = {".csv", ".txt", ".json", ".xlsx", ".xls"}
+
+
+class DataQualityWatcher:
+    """
+    Watches a folder for new files and auto-scans them.
+
+    Features:
+      - Detects new files using polling (no extra library needed)
+      - Waits for file to finish writing before scanning
+      - Maps filename to feed name automatically
+      - Skips temp files (~$, hidden, partial downloads)
+      - Immediate console alert if score triggers threshold
+      - Can run blocking or in background thread
+    """
+
+    def __init__(
+        self,
+        agent,
+        watch_dir:       str,
+        feed_name:       str | None = None,
+        timestamp_field: str        = "Prompt",
+        poll_interval:   float      = 2.0,
+    ):
+        self.agent          = agent
+        self.watch_dir      = Path(watch_dir)
+        self.feed_override  = feed_name
+        self.ts_override    = timestamp_field
+        self.poll_interval  = poll_interval
+        self._seen_files:   set[str] = set()
+        self._running       = False
+        self._thread:       threading.Thread | None = None
+
+        self.watch_dir.mkdir(parents=True, exist_ok=True)
+
+    def start(self, blocking: bool = True):
+        """
+        Start watching.
+          blocking=True  → runs in this thread (use for --watch mode)
+          blocking=False → runs in background thread
+        """
+        self._running = True
+        self._seed_existing_files()
+
+        log.info(f"Watching folder: {self.watch_dir}")
+        log.info(
+            f"Supported file types: {SUPPORTED_EXTENSIONS}"
+        )
+        log.info("Waiting for new files... (Ctrl+C to stop)\n")
+
+        if blocking:
+            self._watch_loop()
+        else:
+            self._thread = threading.Thread(
+                target=self._watch_loop, daemon=True
+            )
+            self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _watch_loop(self):
+        while self._running:
+            try:
+                self._check_for_new_files()
+            except KeyboardInterrupt:
+                log.info("Watcher stopped by user.")
+                break
+            except Exception as e:
+                log.error(f"Watcher error: {e}")
+            time.sleep(self.poll_interval)
+
+    def _check_for_new_files(self):
+        for path in self.watch_dir.iterdir():
+            if path.is_dir():
+                continue
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            # Skip temp files
+            if path.name.startswith(("~$", ".", "_")):
+                continue
+
+            file_key = str(path)
+            if file_key in self._seen_files:
+                continue
+
+            self._seen_files.add(file_key)
+            log.info(f"New file detected: {path.name}")
+            self._process_file(path)
+
+    def _process_file(self, path: Path):
+        """Wait for write to finish then scan."""
+
+        # Wait for stable file size (write complete)
+        max_wait  = 30
+        waited    = 0
+        last_size = -1
+
+        while waited < max_wait:
+            try:
+                current_size = path.stat().st_size
+            except FileNotFoundError:
+                log.warning(f"File disappeared: {path.name}")
+                return
+
+            if current_size == last_size and current_size > 0:
+                break   # stable
+
+            last_size = current_size
+            time.sleep(1)
+            waited += 1
+
+        # Map to feed
+        feed_name, ts_field = self._detect_feed(path.name)
+        if not feed_name:
+            log.warning(
+                f"Could not map '{path.name}' to a feed. "
+                f"Add an entry to FILE_FEED_MAP in watcher.py."
+            )
+            return
+
+        # Run scan
+        log.info(
+            f"Scanning: {path.name} → feed='{feed_name}'"
+        )
+        start = datetime.now()
+
+        try:
+            result  = self.agent.run_file(
+                str(path), feed_name, timestamp_field=ts_field
+            )
+            elapsed = (datetime.now() - start).total_seconds()
+            score   = result["score"]
+            impact  = result["impact"]
+
+            log.info(
+                f"✓ {path.name} | "
+                f"Profile: {score.profile_name} | "
+                f"Score: {score.overall_score:.1f} ({score.grade}) | "
+                f"Risk: {impact.overall_risk_level} | "
+                f"{elapsed:.1f}s"
+            )
+
+            rp = result.get("report_path")
+            if rp:
+                log.info(f"  Report: {rp}")
+
+            # Immediate console alert
+            if score.alert_triggered:
+                print(
+                    f"\n{'!'*60}\n"
+                    f"  ALERT — {path.name}\n"
+                    f"  {score.alert_message}\n"
+                    f"{'!'*60}\n"
+                )
+
+        except Exception as e:
+            log.error(f"✗ Scan failed for {path.name}: {e}")
+
+    def _detect_feed(
+        self, filename: str
+    ) -> tuple[str | None, str]:
+        if self.feed_override:
+            return self.feed_override, self.ts_override
+
+        fn_upper = filename.upper()
+        for keyword, (feed, ts) in FILE_FEED_MAP.items():
+            if keyword.upper() in fn_upper:
+                return feed, ts
+
+        return None, "Prompt"
+
+    def _seed_existing_files(self):
+        """Mark already-existing files so we only scan NEW ones."""
+        count = 0
+        for path in self.watch_dir.iterdir():
+            if (
+                path.is_file() and
+                path.suffix.lower() in SUPPORTED_EXTENSIONS and
+                not path.name.startswith(("~$", ".", "_"))
+            ):
+                self._seen_files.add(str(path))
+                count += 1
+        if count:
+            log.info(
+                f"Seeded {count} existing file(s) — "
+                f"will only scan NEW arrivals."
+            )
+
+
+"""
+main.py — Entry Point — Final Version
+
+USAGE:
+  python main.py --demo
+  python main.py --file OTC_LME_2026_05_29.txt --feed otc_lme_positions
+  python main.py --file payments.csv --feed payment_transactions
+  python main.py --watch C:/data/incoming
+  python main.py --watch C:/data/incoming --feed otc_lme_positions
+"""
+
+import argparse
+import sys
+import pandas as pd
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from src.agent import DataQualityAgent
+
+BASE_DIR   = Path(__file__).parent
+SAMPLE_DIR = BASE_DIR / "sample_data"
+
+
+# ── Demo ──────────────────────────────────────────────────────────────────────
+
+def run_demo():
+    print("\n" + "═"*62)
+    print("  DATA QUALITY AGENT — FINAL VERSION — DEMO RUN")
+    print("═"*62 + "\n")
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "generate_samples",
+        SAMPLE_DIR / "generate_samples.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    mod.generate_payments(500).to_csv(
+        SAMPLE_DIR / "payment_transactions.csv", index=False
+    )
+    mod.generate_trades(200).to_csv(
+        SAMPLE_DIR / "trade_records.csv", index=False
+    )
+    mod.generate_accounts(300).to_csv(
+        SAMPLE_DIR / "customer_accounts.csv", index=False
+    )
+    print("✓ Sample data generated\n")
+
+    agent  = DataQualityAgent()
+    weekly = []
+
+    feeds = [
+        (
+            SAMPLE_DIR / "payment_transactions.csv",
+            "payment_transactions",
+            "transaction_date",
+        ),
+        (
+            SAMPLE_DIR / "trade_records.csv",
+            "trade_records",
+            "trade_date",
+        ),
+        (
+            SAMPLE_DIR / "customer_accounts.csv",
+            "customer_accounts",
+            "open_date",
+        ),
+    ]
+
+    for filepath, feed_name, ts_field in feeds:
+        print(f"{'─'*62}")
+        result = agent.run_file(
+            str(filepath), feed_name, timestamp_field=ts_field
+        )
+        rp = result.get("report_path")
+        if rp:
+            print(f"  ✓ Report:  {rp}")
+            print(
+                f"  ✓ Profile: {result['score'].profile_name} "
+                f"({result['selection'].confidence:.0%} confidence)\n"
+            )
+        s = result["score"]
+        weekly.append({
+            "feed":         feed_name,
+            "date":         s.run_timestamp.strftime("%Y-%m-%d"),
+            "overall":      s.overall_score,
+            "completeness": s.completeness.score,
+            "accuracy":     s.accuracy.score,
+            "consistency":  s.consistency.score,
+            "freshness":    s.freshness.score,
+        })
+
+    from src.reporter import ReportGenerator
+    wp = ReportGenerator().weekly_report(weekly * 3)
+    print(f"{'─'*62}")
+    print(f"  ✓ Weekly:  {wp}")
+    print(f"\n{'═'*62}")
+    print(f"  Reports in: {BASE_DIR / 'reports'}")
+    print(f"  Open any .html file in Chrome to view.")
+    print(f"{'═'*62}\n")
+
+
+# ── Single file scan ──────────────────────────────────────────────────────────
+
+def run_scan(filepath: str, feed_name: str, ts_field: str):
+    agent  = DataQualityAgent()
+    result = agent.run_file(
+        filepath, feed_name, timestamp_field=ts_field
+    )
+    rp = result.get("report_path")
+    if rp:
+        print(f"\n✓ Report saved : {rp}")
+        print(
+            f"  Profile used : {result['score'].profile_name} "
+            f"({result['selection'].confidence:.0%} confidence)"
+        )
+        print(f"  Open in Chrome to view.\n")
+
+
+# ── Real-time watcher ─────────────────────────────────────────────────────────
+
+def run_watcher(watch_dir: str, feed_name: str | None = None):
+    from src.watcher import DataQualityWatcher
+
+    print(f"\n{'═'*62}")
+    print(f"  REAL-TIME WATCHER")
+    print(f"  Folder : {watch_dir}")
+    if feed_name:
+        print(f"  Feed   : {feed_name} (forced)")
+    else:
+        print(f"  Feed   : auto-detected from filename")
+    print(f"  Drop any CSV / TXT / JSON / Excel file to auto-scan.")
+    print(f"  Ctrl+C to stop.")
+    print(f"{'═'*62}\n")
+
+    agent   = DataQualityAgent()
+    watcher = DataQualityWatcher(
+        agent,
+        watch_dir=watch_dir,
+        feed_name=feed_name,
+    )
+    watcher.start(blocking=True)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Data Quality Agent — Final Version"
+    )
+    parser.add_argument(
+        "--file",     type=str,
+        help="Path to file (CSV / JSON / TXT / Excel)"
+    )
+    parser.add_argument(
+        "--feed",     type=str,
+        help="Feed name (must match a key in field_rules.yaml)"
+    )
+    parser.add_argument(
+        "--ts-field", type=str, default="Prompt",
+        help="Timestamp column name (default: Prompt)"
+    )
+    parser.add_argument(
+        "--demo",     action="store_true",
+        help="Run demo with synthetic data"
+    )
+    parser.add_argument(
+        "--watch",    type=str,
+        help="Folder to watch for new files (real-time mode)"
+    )
+    args = parser.parse_args()
+
+    if args.demo:
+        run_demo()
+
+    elif args.watch:
+        run_watcher(args.watch, feed_name=args.feed)
+
+    elif args.file and args.feed:
+        run_scan(args.file, args.feed, args.ts_field)
+
+    else:
+        print("No arguments given — running demo...\n")
+        run_demo()
+
+
+if __name__ == "__main__":
+    main()
